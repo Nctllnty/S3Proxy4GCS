@@ -30,3 +30,4 @@ AGENTS.md
 .vscode/launch.json
 AGENTS.md
 /s3-proxy-docs
+.go-version
