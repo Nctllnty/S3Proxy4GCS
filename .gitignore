@@ -27,3 +27,5 @@ e2e_tests/benchmark_report.json
 /.claude
 CLAUDE.md
 AGENTS.md
+.vscode/launch.json
+AGENTS.md
