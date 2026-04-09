@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,6 +41,21 @@ var gcsClient *storage.Client
 var gcsCtx context.Context
 var reverseProxy *httputil.ReverseProxy
 var gcsURL *url.URL
+
+// Global signer instance (reused across all requests to reduce CPU overhead)
+var signer = v4.NewSigner()
+
+// BufferPool for ReverseProxy to reduce memory allocation and GC pressure
+var proxyBufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 32*1024) // 32KB buffer per goroutine
+	},
+}
+
+type bufferPool struct{ *sync.Pool }
+
+func (p *bufferPool) Get() []byte { return p.Pool.Get().([]byte) }
+func (p *bufferPool) Put(b []byte) { p.Pool.Put(b) }
 
 // Prometheus metrics
 var (
@@ -110,6 +126,10 @@ func main() {
 	}
 
 	reverseProxy = httputil.NewSingleHostReverseProxy(gcsURL)
+
+	// Set BufferPool to reduce memory allocation and GC pressure
+	reverseProxy.BufferPool = &bufferPool{&proxyBufPool}
+
 	if config.Config.DryRun {
 		reverseProxy.Transport = &dryRunTransport{}
 		slog.Info("Reverse Proxy using DryRun Transport (no real hits)")
@@ -201,8 +221,6 @@ func main() {
 					AccessKeyID:     config.Config.ProxyAccessKey,
 					SecretAccessKey: config.Config.ProxySecretKey,
 				}
-
-				signer := v4.NewSigner()
 
 				// Strip User-Agent before re-signing to match aws4gcs known-good pattern
 				req.Header.Del("User-Agent")
