@@ -23,3 +23,7 @@ e2e_tests/benchmark_report.json
 # OS Specific
 .DS_Store
 *.pdf
+.gitnexus
+/.claude
+CLAUDE.md
+AGENTS.md
