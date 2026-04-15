@@ -6,9 +6,11 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -101,6 +103,161 @@ func ComputeDelta(before, after SystemSnapshot, wallClock time.Duration) SystemD
 		GCSAPICallsDelta:  after.GCSAPICalls - before.GCSAPICalls,
 		Before:            before,
 		After:             after,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Network throughput sampling
+// ---------------------------------------------------------------------------
+
+// NetworkStats holds per-benchmark network throughput statistics (MB/s)
+// measured from /proc/net/dev on the benchmark pod.
+type NetworkStats struct {
+	AvgRxMBps float64 `json:"avg_rx_mbps"`
+	MaxRxMBps float64 `json:"max_rx_mbps"`
+	MinRxMBps float64 `json:"min_rx_mbps"`
+	AvgTxMBps float64 `json:"avg_tx_mbps"`
+	MaxTxMBps float64 `json:"max_tx_mbps"`
+	MinTxMBps float64 `json:"min_tx_mbps"`
+	Samples   int     `json:"samples"`
+}
+
+// NetworkSampler periodically reads /proc/net/dev and records per-second
+// Rx/Tx throughput for all non-loopback interfaces combined.
+type NetworkSampler struct {
+	interval  time.Duration
+	rxSamples []float64
+	txSamples []float64
+	mu        sync.Mutex
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+}
+
+// NewNetworkSampler creates a sampler with the given poll interval.
+func NewNetworkSampler(interval time.Duration) *NetworkSampler {
+	return &NetworkSampler{
+		interval: interval,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+	}
+}
+
+// Start begins background sampling. Returns immediately.
+func (ns *NetworkSampler) Start() {
+	go func() {
+		defer close(ns.doneCh)
+
+		prevRx, prevTx, err := readNetworkBytes()
+		if err != nil {
+			return // /proc/net/dev not available (non-Linux environment)
+		}
+		prevTime := time.Now()
+
+		ticker := time.NewTicker(ns.interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ns.stopCh:
+				return
+			case t := <-ticker.C:
+				rx, tx, err := readNetworkBytes()
+				if err != nil {
+					continue
+				}
+				elapsed := t.Sub(prevTime).Seconds()
+				if elapsed > 0 && rx >= prevRx && tx >= prevTx {
+					rxMBps := float64(rx-prevRx) / elapsed / (1024 * 1024)
+					txMBps := float64(tx-prevTx) / elapsed / (1024 * 1024)
+					ns.mu.Lock()
+					ns.rxSamples = append(ns.rxSamples, rxMBps)
+					ns.txSamples = append(ns.txSamples, txMBps)
+					ns.mu.Unlock()
+				}
+				prevRx, prevTx = rx, tx
+				prevTime = t
+			}
+		}
+	}()
+}
+
+// Stop terminates sampling and returns the collected statistics.
+func (ns *NetworkSampler) Stop() NetworkStats {
+	close(ns.stopCh)
+	<-ns.doneCh
+
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	return computeNetworkStats(ns.rxSamples, ns.txSamples)
+}
+
+// readNetworkBytes returns cumulative Rx/Tx bytes summed across all
+// non-loopback interfaces by parsing /proc/net/dev.
+func readNetworkBytes() (rxBytes, txBytes uint64, err error) {
+	data, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n")[2:] { // skip 2-line header
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		colonIdx := strings.Index(line, ":")
+		if colonIdx < 0 {
+			continue
+		}
+		iface := strings.TrimSpace(line[:colonIdx])
+		if iface == "lo" {
+			continue
+		}
+		fields := strings.Fields(line[colonIdx+1:])
+		if len(fields) < 9 {
+			continue
+		}
+		rx, _ := strconv.ParseUint(fields[0], 10, 64)
+		tx, _ := strconv.ParseUint(fields[8], 10, 64)
+		rxBytes += rx
+		txBytes += tx
+	}
+	return rxBytes, txBytes, nil
+}
+
+// computeNetworkStats derives min/max/avg from per-second throughput samples.
+func computeNetworkStats(rxSamples, txSamples []float64) NetworkStats {
+	n := len(rxSamples)
+	if n == 0 {
+		return NetworkStats{}
+	}
+	var rxSum, txSum float64
+	rxMin, rxMax := rxSamples[0], rxSamples[0]
+	txMin, txMax := txSamples[0], txSamples[0]
+	for i, rx := range rxSamples {
+		rxSum += rx
+		if rx < rxMin {
+			rxMin = rx
+		}
+		if rx > rxMax {
+			rxMax = rx
+		}
+		tx := txSamples[i]
+		txSum += tx
+		if tx < txMin {
+			txMin = tx
+		}
+		if tx > txMax {
+			txMax = tx
+		}
+	}
+	fn := float64(n)
+	return NetworkStats{
+		AvgRxMBps: math.Round(rxSum/fn*100) / 100,
+		MaxRxMBps: math.Round(rxMax*100) / 100,
+		MinRxMBps: math.Round(rxMin*100) / 100,
+		AvgTxMBps: math.Round(txSum/fn*100) / 100,
+		MaxTxMBps: math.Round(txMax*100) / 100,
+		MinTxMBps: math.Round(txMin*100) / 100,
+		Samples:   n,
 	}
 }
 

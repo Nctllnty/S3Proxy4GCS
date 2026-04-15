@@ -19,6 +19,8 @@ env:
   GKE_REGION: us-east1
   GAR_REGISTRY: us-east1-docker.pkg.dev/cbs-poctest/s3proxy
   K8S_NAMESPACE: s3proxy-e2e
+  # Benchmark Job pod scheduling (must match k8s/benchmark-job.yaml nodeSelector)
+  BENCHMARK_NODE_POOL: benchmark-c4-pool
 
 jobs:
   benchmark:
@@ -118,6 +120,7 @@ jobs:
       # ---- Run Benchmark as K8s Job ----
       - name: Run Benchmark Job (In-Cluster, Pod-to-Pod)
         run: |
+          echo "Benchmark pods schedule to GKE node pool: ${{ env.BENCHMARK_NODE_POOL }} (nodeSelector in k8s/benchmark-job.yaml)"
           BENCH_IMAGE="${{ env.GAR_REGISTRY }}/s3proxy-benchmark:${{ steps.meta.outputs.tag }}"
 
           # Delete any previous benchmark job
@@ -224,6 +227,14 @@ jobs:
             echo "|------|--------|-----------|-------------|------------|--------|" >> $GITHUB_STEP_SUMMARY
 
             jq -r '.results[] | "| \(.name) | \(.system_metrics.cpu_usage_percent) | \(.system_metrics.memory_delta_mb) | \(.system_metrics.peak_resident_mb | . * 10 | round / 10) | \(.system_metrics.goroutine_delta) | \(.system_metrics.http_requests_delta) |"' results/benchmark_report.json >> $GITHUB_STEP_SUMMARY
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Network Throughput (benchmark pod, MB/s)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Test | Rx avg | Rx max | Rx min | Tx avg | Tx max | Tx min |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|--------|--------|--------|--------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+
+            jq -r '.results[] | "| \(.name) | \(.network_stats.avg_rx_mbps) | \(.network_stats.max_rx_mbps) | \(.network_stats.min_rx_mbps) | \(.network_stats.avg_tx_mbps) | \(.network_stats.max_tx_mbps) | \(.network_stats.min_tx_mbps) |"' results/benchmark_report.json >> $GITHUB_STEP_SUMMARY
           else
             echo "> ⚠️ No benchmark_report.json found. Check logs for errors." >> $GITHUB_STEP_SUMMARY
           fi

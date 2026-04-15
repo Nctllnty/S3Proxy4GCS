@@ -60,19 +60,20 @@ type BenchmarkConfig struct {
 
 // BenchmarkResult holds a single benchmark's statistics.
 type BenchmarkResult struct {
-	Name        string      `json:"name"`
-	PayloadSize string      `json:"payload_size"`
-	Concurrency int         `json:"concurrency"`
-	DurationSec float64     `json:"duration_sec"`
-	TotalOps    int64       `json:"total_ops"`
-	Errors      int64       `json:"errors"`
-	OpsPerSec   float64     `json:"ops_per_sec"`
-	P50Ms       float64     `json:"p50_ms"`
-	P95Ms       float64     `json:"p95_ms"`
-	P99Ms       float64     `json:"p99_ms"`
-	AvgMs       float64     `json:"avg_ms"`
-	MaxMs       float64     `json:"max_ms"`
-	System      SystemDelta `json:"system_metrics"`
+	Name        string       `json:"name"`
+	PayloadSize string       `json:"payload_size"`
+	Concurrency int          `json:"concurrency"`
+	DurationSec float64      `json:"duration_sec"`
+	TotalOps    int64        `json:"total_ops"`
+	Errors      int64        `json:"errors"`
+	OpsPerSec   float64      `json:"ops_per_sec"`
+	P50Ms       float64      `json:"p50_ms"`
+	P95Ms       float64      `json:"p95_ms"`
+	P99Ms       float64      `json:"p99_ms"`
+	AvgMs       float64      `json:"avg_ms"`
+	MaxMs       float64      `json:"max_ms"`
+	System      SystemDelta  `json:"system_metrics"`
+	Network     NetworkStats `json:"network_stats"`
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +163,8 @@ func runConcurrentLoad(concurrency int, duration time.Duration, fn func() error)
 	}
 }
 
-// toBenchmarkResult constructs a BenchmarkResult from load results + system delta.
-func toBenchmarkResult(name, payloadSize string, concurrency int, lr loadResult, wallClock time.Duration, delta SystemDelta) BenchmarkResult {
+// toBenchmarkResult constructs a BenchmarkResult from load results + system delta + network stats.
+func toBenchmarkResult(name, payloadSize string, concurrency int, lr loadResult, wallClock time.Duration, delta SystemDelta, netStats NetworkStats) BenchmarkResult {
 	opsPerSec := 0.0
 	if wallClock.Seconds() > 0 {
 		opsPerSec = float64(len(lr.latencies)) / wallClock.Seconds()
@@ -188,6 +189,7 @@ func toBenchmarkResult(name, payloadSize string, concurrency int, lr loadResult,
 		AvgMs:       durationMs(avgDuration(lr.latencies)),
 		MaxMs:       maxMs,
 		System:      delta,
+		Network:     netStats,
 	}
 }
 
@@ -246,6 +248,8 @@ func TestBenchmarkSuite(t *testing.T) {
 
 		before, _ := mc.Snapshot()
 		start := time.Now()
+		ns := NewNetworkSampler(time.Second)
+		ns.Start()
 
 		lr := runConcurrentLoad(concurrency, duration, func() error {
 			key := fmt.Sprintf("%sbench-put-%s-%d", testEnv.TestPrefix, tier.Name, time.Now().UnixNano())
@@ -266,11 +270,12 @@ func TestBenchmarkSuite(t *testing.T) {
 			return err
 		})
 
+		netStats := ns.Stop()
 		wallClock := time.Since(start)
 		after, _ := mc.Snapshot()
 		delta := ComputeDelta(before, after, wallClock)
 
-		result := toBenchmarkResult("PutObject_"+tier.Name, tier.Name, concurrency, lr, wallClock, delta)
+		result := toBenchmarkResult("PutObject_"+tier.Name, tier.Name, concurrency, lr, wallClock, delta, netStats)
 		report.Results = append(report.Results, result)
 
 		printBenchResult(t, result)
@@ -298,6 +303,8 @@ func TestBenchmarkSuite(t *testing.T) {
 
 		before, _ := mc.Snapshot()
 		start := time.Now()
+		ns := NewNetworkSampler(time.Second)
+		ns.Start()
 
 		lr := runConcurrentLoad(concurrency, duration, func() error {
 			out, err := client.GetObject(context.TODO(), &s3.GetObjectInput{
@@ -312,11 +319,12 @@ func TestBenchmarkSuite(t *testing.T) {
 			return nil
 		})
 
+		netStats := ns.Stop()
 		wallClock := time.Since(start)
 		after, _ := mc.Snapshot()
 		delta := ComputeDelta(before, after, wallClock)
 
-		result := toBenchmarkResult("GetObject_"+tier.Name, tier.Name, concurrency, lr, wallClock, delta)
+		result := toBenchmarkResult("GetObject_"+tier.Name, tier.Name, concurrency, lr, wallClock, delta, netStats)
 		report.Results = append(report.Results, result)
 
 		printBenchResult(t, result)
@@ -329,6 +337,8 @@ func TestBenchmarkSuite(t *testing.T) {
 
 	before, _ := mc.Snapshot()
 	start := time.Now()
+	nsCRUD := NewNetworkSampler(time.Second)
+	nsCRUD.Start()
 
 	crudLR := runConcurrentLoad(concurrency, duration, func() error {
 		key := fmt.Sprintf("%sbench-crud-%d", testEnv.TestPrefix, time.Now().UnixNano())
@@ -359,11 +369,12 @@ func TestBenchmarkSuite(t *testing.T) {
 		return err
 	})
 
+	netStatsCRUD := nsCRUD.Stop()
 	wallClock := time.Since(start)
 	after, _ := mc.Snapshot()
 	delta := ComputeDelta(before, after, wallClock)
 
-	crudResult := toBenchmarkResult("PutGetDelete_CRUD", "1KB", concurrency, crudLR, wallClock, delta)
+	crudResult := toBenchmarkResult("PutGetDelete_CRUD", "1KB", concurrency, crudLR, wallClock, delta, netStatsCRUD)
 	report.Results = append(report.Results, crudResult)
 	printBenchResult(t, crudResult)
 
@@ -379,6 +390,8 @@ func TestBenchmarkSuite(t *testing.T) {
 
 	before, _ = mc.Snapshot()
 	start = time.Now()
+	nsLC := NewNetworkSampler(time.Second)
+	nsLC.Start()
 
 	lcLR := runConcurrentLoad(concurrency, duration, func() error {
 		_, err := client.PutBucketLifecycleConfiguration(context.TODO(), &s3.PutBucketLifecycleConfigurationInput{
@@ -399,11 +412,12 @@ func TestBenchmarkSuite(t *testing.T) {
 		return err
 	})
 
+	netStatsLC := nsLC.Stop()
 	wallClock = time.Since(start)
 	after, _ = mc.Snapshot()
 	delta = ComputeDelta(before, after, wallClock)
 
-	lcResult := toBenchmarkResult("PutBucketLifecycle", "N/A", concurrency, lcLR, wallClock, delta)
+	lcResult := toBenchmarkResult("PutBucketLifecycle", "N/A", concurrency, lcLR, wallClock, delta, netStatsLC)
 	report.Results = append(report.Results, lcResult)
 	printBenchResult(t, lcResult)
 
@@ -454,6 +468,20 @@ func TestBenchmarkSuite(t *testing.T) {
 			r.System.PeakResidentMB, r.System.GoroutineDelta, r.System.HTTPRequestsDelta)
 	}
 	fmt.Println("================================================================================")
+	fmt.Println()
+
+	// Print network throughput summary
+	fmt.Println("  Network Throughput (benchmark pod, MB/s):")
+	fmt.Printf("  %-25s %10s %10s %10s %10s %10s %10s\n",
+		"Name", "Rx avg", "Rx max", "Rx min", "Tx avg", "Tx max", "Tx min")
+	fmt.Println("  " + strings.Repeat("-", 90))
+	for _, r := range report.Results {
+		fmt.Printf("  %-25s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n",
+			r.Name,
+			r.Network.AvgRxMBps, r.Network.MaxRxMBps, r.Network.MinRxMBps,
+			r.Network.AvgTxMBps, r.Network.MaxTxMBps, r.Network.MinTxMBps)
+	}
+	fmt.Println("================================================================================")
 }
 
 func printBenchResult(t *testing.T, r BenchmarkResult) {
@@ -462,5 +490,8 @@ func printBenchResult(t *testing.T, r BenchmarkResult) {
 	t.Logf("  [system] CPU=%.1f%%  Mem\u0394=%.1fMB  PeakMem=%.1fMB  Goroutine\u0394=%.0f  HTTP\u0394=%.0f",
 		r.System.CPUUsagePercent, r.System.MemoryDeltaMB,
 		r.System.PeakResidentMB, r.System.GoroutineDelta, r.System.HTTPRequestsDelta)
+	t.Logf("  [network] Rx avg=%.2f max=%.2f min=%.2f MB/s | Tx avg=%.2f max=%.2f min=%.2f MB/s (samples=%d)",
+		r.Network.AvgRxMBps, r.Network.MaxRxMBps, r.Network.MinRxMBps,
+		r.Network.AvgTxMBps, r.Network.MaxTxMBps, r.Network.MinTxMBps, r.Network.Samples)
 	t.Log("")
 }

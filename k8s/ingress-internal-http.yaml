@@ -1,0 +1,22 @@
+# Internal HTTP(S) Load Balancer (L7) on GCP — routes port 80 to Service s3proxy:8080.
+# Requires IngressClass gce-internal (GKE-managed). HTTP only (no TLS block).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: s3proxy-internal-http
+  namespace: s3proxy-e2e
+  labels:
+    app: s3proxy
+  annotations:
+    kubernetes.io/ingress.class: "gce-internal"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: s3proxy
+                port:
+                  number: 8080

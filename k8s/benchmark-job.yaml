@@ -35,6 +35,9 @@ spec:
         app: benchmark
     spec:
       serviceAccountName: s3proxy
+      # Pin benchmark workload to dedicated perf node pool (GKE)
+      nodeSelector:
+        cloud.google.com/gke-nodepool: benchmark-c4-pool
       # Ensure benchmark and s3proxy pods land on different nodes
       affinity:
         podAntiAffinity:
@@ -83,7 +86,7 @@ spec:
             # Guaranteed QoS: requests == limits to avoid CPU throttling
             requests:
               cpu: "2000m"
-              memory: "512Mi"
+              memory: "4000Mi"
             limits:
               cpu: "2000m"
-              memory: "512Mi"
+              memory: "4000Mi"
