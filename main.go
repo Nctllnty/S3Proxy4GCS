@@ -20,19 +20,216 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/api/option"
 	"s3proxy4gcs/config"
 	"s3proxy4gcs/pkg/translate"
 )
 
-var gcsClient *storage.Client
-var gcsCtx context.Context
-var reverseProxy *httputil.ReverseProxy
-var gcsURL *url.URL
+var (
+	gcsClient    *storage.Client
+	gcsCtx       context.Context
+	reverseProxy *httputil.ReverseProxy
+	gcsURL       *url.URL
+
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_http_requests_total",
+			Help: "Total number of HTTP requests handled by the proxy.",
+		},
+		[]string{"method", "route", "status"},
+	)
+	httpRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "s3proxy_http_request_duration_seconds",
+			Help:    "End-to-end HTTP request duration in seconds.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		},
+		[]string{"method", "route"},
+	)
+	httpInFlightRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "s3proxy_http_in_flight_requests",
+			Help: "Current number of in-flight HTTP requests by route.",
+		},
+		[]string{"route"},
+	)
+	gcsSDKRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_gcs_sdk_requests_total",
+			Help: "Total number of GCS SDK calls made by control-plane handlers.",
+		},
+		[]string{"operation", "result"},
+	)
+	gcsSDKRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "s3proxy_gcs_sdk_request_duration_seconds",
+			Help:    "Duration of GCS SDK calls made by control-plane handlers.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		},
+		[]string{"operation", "result"},
+	)
+	upstreamRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_upstream_requests_total",
+			Help: "Total number of upstream requests sent to GCS.",
+		},
+		[]string{"method", "status_class"},
+	)
+	upstreamRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "s3proxy_upstream_request_duration_seconds",
+			Help:    "Duration of upstream requests sent to GCS.",
+			Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+		},
+		[]string{"method"},
+	)
+	requestsRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_requests_rejected_total",
+			Help: "Total number of rejected or degraded requests by reason.",
+		},
+		[]string{"reason"},
+	)
+	readinessChecksTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_readiness_checks_total",
+			Help: "Total number of readiness checks by result.",
+		},
+		[]string{"result"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(
+		httpRequestsTotal,
+		httpRequestDuration,
+		httpInFlightRequests,
+		gcsSDKRequestsTotal,
+		gcsSDKRequestDuration,
+		upstreamRequestsTotal,
+		upstreamRequestDuration,
+		requestsRejectedTotal,
+		readinessChecksTotal,
+	)
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+type metricsTransport struct {
+	base http.RoundTripper
+}
+
+func (t *metricsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	resp, err := t.base.RoundTrip(req)
+	upstreamRequestDuration.WithLabelValues(req.Method).Observe(time.Since(start).Seconds())
+	if err != nil {
+		upstreamRequestsTotal.WithLabelValues(req.Method, "error").Inc()
+		return nil, err
+	}
+	upstreamRequestsTotal.WithLabelValues(req.Method, statusClass(resp.StatusCode)).Inc()
+	return resp, nil
+}
+
+func routeLabelForRequest(r *http.Request) string {
+	switch r.URL.Path {
+	case "/health":
+		return "health"
+	case "/readyz":
+		return "readyz"
+	case "/metrics":
+		return "metrics"
+	}
+
+	for _, key := range []string{"lifecycle", "cors", "logging", "website", "tagging"} {
+		for actualKey := range r.URL.Query() {
+			if strings.EqualFold(actualKey, key) {
+				return key
+			}
+		}
+	}
+
+	return "s3"
+}
+
+func statusClass(statusCode int) string {
+	if statusCode < 100 {
+		return "unknown"
+	}
+	return strconv.Itoa(statusCode/100) + "xx"
+}
+
+func observabilityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		route := routeLabelForRequest(r)
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
+		httpInFlightRequests.WithLabelValues(route).Inc()
+		defer httpInFlightRequests.WithLabelValues(route).Dec()
+
+		next.ServeHTTP(rec, r)
+
+		httpRequestsTotal.WithLabelValues(r.Method, route, strconv.Itoa(rec.status)).Inc()
+		httpRequestDuration.WithLabelValues(r.Method, route).Observe(time.Since(start).Seconds())
+	})
+}
+
+func timeGCSCall(ctx context.Context, operation string, fn func(context.Context) error) error {
+	start := time.Now()
+	err := fn(ctx)
+	result := "success"
+	if err != nil {
+		result = "error"
+	}
+
+	gcsSDKRequestsTotal.WithLabelValues(operation, result).Inc()
+	gcsSDKRequestDuration.WithLabelValues(operation, result).Observe(time.Since(start).Seconds())
+	return err
+}
+
+func recordRejectedRequest(reason string) {
+	requestsRejectedTotal.WithLabelValues(reason).Inc()
+}
+
+func handleReadyz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if config.Config.DryRun {
+		readinessChecksTotal.WithLabelValues("success").Inc()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ready","mode":"dry_run"}`))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if _, err := gcsClient.Bucket(config.Config.TargetBucket).Attrs(ctx); err != nil {
+		readinessChecksTotal.WithLabelValues("error").Inc()
+		slog.Error("Readiness check failed", "bucket", config.Config.TargetBucket, "error", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `{"status":"not_ready","error":%q}`, err.Error())
+		return
+	}
+
+	readinessChecksTotal.WithLabelValues("success").Inc()
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ready"}`))
+}
 
 func main() {
 	// Initialize configuration
@@ -72,23 +269,25 @@ func main() {
 	}
 
 	reverseProxy = httputil.NewSingleHostReverseProxy(gcsURL)
+	var baseTransport http.RoundTripper
 	if config.Config.DryRun {
-		reverseProxy.Transport = &dryRunTransport{}
+		baseTransport = &dryRunTransport{}
 		slog.Info("Reverse Proxy using DryRun Transport (no real hits)")
 	} else {
-		reverseProxy.Transport = &http.Transport{
-			MaxIdleConns:        config.Config.MaxIdleConns,
-			MaxIdleConnsPerHost: config.Config.MaxIdleConnsPerHost,
+		baseTransport = &http.Transport{
+			MaxIdleConns:          config.Config.MaxIdleConns,
+			MaxIdleConnsPerHost:   config.Config.MaxIdleConnsPerHost,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
-			DisableCompression:    true, // Preserve Accept-Encoding for S3 signatures
-			ForceAttemptHTTP2:     true, // Enable HTTP/2 for multiplexing
+			DisableCompression:    true,
+			ForceAttemptHTTP2:     true,
 		}
 		slog.Info("Reverse Proxy using tuned Transport with timeouts",
 			"MaxIdleConns", config.Config.MaxIdleConns,
 			"MaxIdleConnsPerHost", config.Config.MaxIdleConnsPerHost)
 	}
+	reverseProxy.Transport = &metricsTransport{base: baseTransport}
 
 	reverseProxy.Director = func(req *http.Request) {
 		req.URL.Host = gcsURL.Host
@@ -156,6 +355,7 @@ func main() {
 
 		if shouldResign {
 			if config.Config.ProxyAccessKey == "" || config.Config.ProxySecretKey == "" {
+				recordRejectedRequest("resign_skipped_missing_credentials")
 				slog.Warn("Proxy HMAC credentials not set! Re-signing skipped. Signature will fail at GCS.")
 			} else {
 				payloadHash := req.Header.Get("X-Amz-Content-Sha256")
@@ -169,11 +369,12 @@ func main() {
 				}
 
 				signer := v4.NewSigner()
-				
+
 				// Strip User-Agent before re-signing to match aws4gcs known-good pattern
 				req.Header.Del("User-Agent")
 
 				if err := signer.SignHTTP(req.Context(), awsCreds, req, payloadHash, "s3", "us-east-1", time.Now()); err != nil {
+					recordRejectedRequest("resign_failed")
 					slog.Error("Failed to re-sign request", "error", err)
 				} else {
 					slog.Info("Successfully re-signed request for GCS")
@@ -208,12 +409,15 @@ func main() {
 	// Base middlewares
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	r.Use(observabilityMiddleware)
 
 	// API Handlers
+	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
+	r.Get("/readyz", handleReadyz)
 
 	// Pass-through or intercept handlers
 	r.Route("/", func(r chi.Router) {
@@ -401,7 +605,10 @@ func handlePutLifecycle(w http.ResponseWriter, r *http.Request) {
 		Lifecycle: &storageLifecycle,
 	}
 
-	_, err = bucket.Update(r.Context(), uattrs)
+	err = timeGCSCall(r.Context(), "PutBucketLifecycle", func(ctx context.Context) error {
+		_, err := bucket.Update(ctx, uattrs)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to update GCS bucket lifecycle", "bucket", config.Config.TargetBucket, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error: %v", err), http.StatusBadGateway)
@@ -446,7 +653,10 @@ func handlePutCORS(w http.ResponseWriter, r *http.Request) {
 		CORS: gcsCORS,
 	}
 
-	_, err = bucket.Update(r.Context(), uattrs)
+	err = timeGCSCall(r.Context(), "PutBucketCORS", func(ctx context.Context) error {
+		_, err := bucket.Update(ctx, uattrs)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to update GCS bucket CORS", "bucket", config.Config.TargetBucket, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error: %v", err), http.StatusBadGateway)
@@ -460,7 +670,12 @@ func handlePutCORS(w http.ResponseWriter, r *http.Request) {
 
 func handleGetCORS(w http.ResponseWriter, r *http.Request) {
 	bucket := gcsClient.Bucket(config.Config.TargetBucket)
-	attrs, err := bucket.Attrs(r.Context())
+	var attrs *storage.BucketAttrs
+	err := timeGCSCall(r.Context(), "GetBucketCORS", func(ctx context.Context) error {
+		var err error
+		attrs, err = bucket.Attrs(ctx)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to fetch GCS bucket attributes for CORS", "bucket", config.Config.TargetBucket, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error: %v", err), http.StatusBadGateway)
@@ -483,7 +698,10 @@ func handleDeleteCORS(w http.ResponseWriter, r *http.Request) {
 		CORS: []storage.CORS{},
 	}
 
-	_, err := bucket.Update(r.Context(), uattrs)
+	err := timeGCSCall(r.Context(), "DeleteBucketCORS", func(ctx context.Context) error {
+		_, err := bucket.Update(ctx, uattrs)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to reset GCS bucket CORS", "bucket", config.Config.TargetBucket, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error deleting CORS: %v", err), http.StatusBadGateway)
@@ -527,7 +745,10 @@ func handlePutLogging(w http.ResponseWriter, r *http.Request) {
 		Logging: gcsLogging,
 	}
 
-	_, err = bucket.Update(r.Context(), uattrs)
+	err = timeGCSCall(r.Context(), "PutBucketLogging", func(ctx context.Context) error {
+		_, err := bucket.Update(ctx, uattrs)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to update GCS bucket Logging", "bucket", config.Config.TargetBucket, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error: %v", err), http.StatusBadGateway)
@@ -541,7 +762,12 @@ func handlePutLogging(w http.ResponseWriter, r *http.Request) {
 
 func handleGetLogging(w http.ResponseWriter, r *http.Request) {
 	bucket := gcsClient.Bucket(config.Config.TargetBucket)
-	attrs, err := bucket.Attrs(r.Context())
+	var attrs *storage.BucketAttrs
+	err := timeGCSCall(r.Context(), "GetBucketLogging", func(ctx context.Context) error {
+		var err error
+		attrs, err = bucket.Attrs(ctx)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to fetch GCS bucket attributes for Logging", "bucket", config.Config.TargetBucket, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error: %v", err), http.StatusBadGateway)
@@ -560,7 +786,10 @@ func handleDeleteLogging(w http.ResponseWriter, r *http.Request) {
 		Logging: &storage.BucketLogging{},
 	}
 
-	_, err := bucket.Update(r.Context(), uattrs)
+	err := timeGCSCall(r.Context(), "DeleteBucketLogging", func(ctx context.Context) error {
+		_, err := bucket.Update(ctx, uattrs)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to reset GCS bucket Logging", "bucket", config.Config.TargetBucket, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error deleting Logging: %v", err), http.StatusBadGateway)
@@ -604,7 +833,10 @@ func handlePutWebsite(w http.ResponseWriter, r *http.Request) {
 		Website: gcsWebsite,
 	}
 
-	_, err = bucket.Update(r.Context(), uattrs)
+	err = timeGCSCall(r.Context(), "PutBucketWebsite", func(ctx context.Context) error {
+		_, err := bucket.Update(ctx, uattrs)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to update GCS bucket Website", "bucket", config.Config.TargetBucket, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error: %v", err), http.StatusBadGateway)
@@ -636,6 +868,7 @@ func handlePutObjectTagging(w http.ResponseWriter, r *http.Request) {
 	// Determine target bucket and object from URL path (e.g., /test-bucket/object-path)
 	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(pathParts) < 2 || pathParts[0] == "" || pathParts[1] == "" {
+		recordRejectedRequest("invalid_object_path")
 		http.Error(w, "Bucket and Object name required", http.StatusBadRequest)
 		return
 	}
@@ -653,7 +886,12 @@ func handlePutObjectTagging(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Fetch existing object metadata for read-modify-write
 	obj := gcsClient.Bucket(targetBucket).Object(targetObject)
-	attrs, err := obj.Attrs(r.Context())
+	var attrs *storage.ObjectAttrs
+	err = timeGCSCall(r.Context(), "GetObjectTaggingAttrs", func(ctx context.Context) error {
+		var err error
+		attrs, err = obj.Attrs(ctx)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to fetch object attributes for read-modify-write", "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error fetching attributes: %v", err), http.StatusNotFound) // Use NotFound for safety or Internal
@@ -668,9 +906,12 @@ func handlePutObjectTagging(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. Update Object using OCC via IfMetagenerationMatch
-	_, err = obj.If(storage.Conditions{
-		MetagenerationMatch: attrs.Metageneration,
-	}).Update(r.Context(), uattrs)
+	err = timeGCSCall(r.Context(), "PutObjectTagging", func(ctx context.Context) error {
+		_, err := obj.If(storage.Conditions{
+			MetagenerationMatch: attrs.Metageneration,
+		}).Update(ctx, uattrs)
+		return err
+	})
 
 	if err != nil {
 		slog.Error("GCS API error applying Tagging", "error", err)
@@ -686,6 +927,7 @@ func handlePutObjectTagging(w http.ResponseWriter, r *http.Request) {
 func handleGetObjectTagging(w http.ResponseWriter, r *http.Request) {
 	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(pathParts) < 2 || pathParts[0] == "" || pathParts[1] == "" {
+		recordRejectedRequest("invalid_object_path")
 		http.Error(w, "Bucket and Object name required", http.StatusBadRequest)
 		return
 	}
@@ -693,7 +935,12 @@ func handleGetObjectTagging(w http.ResponseWriter, r *http.Request) {
 	targetObject := strings.Join(pathParts[1:], "/")
 
 	obj := gcsClient.Bucket(targetBucket).Object(targetObject)
-	attrs, err := obj.Attrs(r.Context())
+	var attrs *storage.ObjectAttrs
+	err := timeGCSCall(r.Context(), "GetObjectTagging", func(ctx context.Context) error {
+		var err error
+		attrs, err = obj.Attrs(ctx)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to fetch GCS Object attributes for GetTagging", "bucket", targetBucket, "object", targetObject, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error fetching attributes: %v", err), http.StatusNotFound)
@@ -709,6 +956,7 @@ func handleGetObjectTagging(w http.ResponseWriter, r *http.Request) {
 func handleDeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
 	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(pathParts) < 2 || pathParts[0] == "" || pathParts[1] == "" {
+		recordRejectedRequest("invalid_object_path")
 		http.Error(w, "Bucket and Object name required", http.StatusBadRequest)
 		return
 	}
@@ -716,7 +964,12 @@ func handleDeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
 	targetObject := strings.Join(pathParts[1:], "/")
 
 	obj := gcsClient.Bucket(targetBucket).Object(targetObject)
-	attrs, err := obj.Attrs(r.Context())
+	var attrs *storage.ObjectAttrs
+	err := timeGCSCall(r.Context(), "GetDeleteObjectTaggingAttrs", func(ctx context.Context) error {
+		var err error
+		attrs, err = obj.Attrs(ctx)
+		return err
+	})
 	if err != nil {
 		slog.Error("Failed to fetch GCS Object attributes for DeleteTagging", "bucket", targetBucket, "object", targetObject, "error", err)
 		http.Error(w, fmt.Sprintf("GCS API error: %v", err), http.StatusNotFound)
@@ -734,9 +987,12 @@ func handleDeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
 		Metadata: updateMetadata,
 	}
 
-	_, err = obj.If(storage.Conditions{
-		MetagenerationMatch: attrs.Metageneration,
-	}).Update(r.Context(), uattrs)
+	err = timeGCSCall(r.Context(), "DeleteObjectTagging", func(ctx context.Context) error {
+		_, err := obj.If(storage.Conditions{
+			MetagenerationMatch: attrs.Metageneration,
+		}).Update(ctx, uattrs)
+		return err
+	})
 
 	if err != nil {
 		slog.Error("GCS API error deleting Object Tagging", "bucket", targetBucket, "object", targetObject, "error", err)

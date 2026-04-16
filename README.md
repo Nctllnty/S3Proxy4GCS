@@ -92,10 +92,45 @@ func createS3Client() (*s3.Client, error) {
 - **Lifecycle Intercept**: Translates S3 XML Lifecycle Configuration to GCS JSON.
 - **Real GCS Forwarding**: Submits translated JSON to GCS via official GCS Go SDK.
 - **Structured JSON Logging**: Native `log/slog` for modern cloud observability (Parsable JSON lines). Toggle `DEBUG_LOGGING=true` for verbose output.
+- **Prometheus Metrics**: Exposes `/metrics` with HTTP, GCS SDK, upstream proxy, readiness, and rejection metrics for operational visibility.
 - **Reliable Timeouts**: Set timeouts on `http.Transport` to prevent hanging connections.
 - **Graceful Shutdown**: Listens for `SIGTERM`/`SIGINT` and waits up to 10s for draining requests.
 - **Prefix Isolation**: Use `GCS_PREFIX` for test isolation.
 - **DryRun Toggle**: Use `DRY_RUN=true` to disable real GCS API hits (safe for local laptop testing).
+
+---
+
+## Observability
+
+The proxy exposes the following operational endpoints on the same port as the main service:
+
+- `GET /health`: basic liveness check
+- `GET /readyz`: readiness check backed by a GCS bucket metadata call unless `DRY_RUN=true`
+- `GET /metrics`: Prometheus scrape endpoint
+
+### Key Metrics
+
+- `s3proxy_http_requests_total{method,route,status}`: total inbound requests split by fixed route labels such as `s3`, `health`, `readyz`, `metrics`, `lifecycle`, `cors`, `logging`, `website`, and `tagging`
+- `s3proxy_http_request_duration_seconds{method,route}`: end-to-end request latency seen by clients
+- `s3proxy_http_in_flight_requests{route}`: current in-flight requests per route
+- `s3proxy_gcs_sdk_requests_total{operation,result}`: success/error counts for control-plane GCS SDK calls
+- `s3proxy_gcs_sdk_request_duration_seconds{operation,result}`: latency of control-plane GCS SDK calls
+- `s3proxy_upstream_requests_total{method,status_class}`: upstream GCS proxy traffic split by HTTP method and status class
+- `s3proxy_upstream_request_duration_seconds{method}`: upstream GCS proxy latency
+- `s3proxy_requests_rejected_total{reason}`: degraded or rejected requests such as invalid object paths or re-sign failures
+- `s3proxy_readiness_checks_total{result}`: readiness probe success/error counts
+
+### Label Guardrails
+
+- Route and reason labels are fixed low-cardinality enums to avoid cardinality blow-ups.
+- Raw paths, bucket names, and object keys are intentionally not exported as metric labels.
+- Upstream status is grouped as `2xx`, `4xx`, `5xx`, or `error` rather than per-object labels.
+
+### Scrape Example
+
+```bash
+curl http://localhost:8080/metrics
+```
 
 ---
 
