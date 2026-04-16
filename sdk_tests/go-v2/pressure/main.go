@@ -53,9 +53,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/smithy-go/middleware"
 )
 
 type latencyMs struct {
@@ -93,16 +91,6 @@ func percentileMs(sorted []time.Duration, p float64) float64 {
 		idx = len(sorted) - 1
 	}
 	return float64(sorted[idx].Microseconds()) / 1000.0
-}
-
-// forceUnsignedPayload swaps SDK v2's default "compute SHA256 payload"
-// middleware for the SDK's own UnsignedPayload variant. The signed
-// request uses x-amz-content-sha256: UNSIGNED-PAYLOAD, so the SigV4
-// canonical request does not depend on body bytes. This is the AWS
-// SDK-supported way to opt out of aws-chunked / streaming payload
-// signing and is accepted by s3proxy and the GCS XML API.
-func forceUnsignedPayload(stack *middleware.Stack) error {
-	return v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware(stack)
 }
 
 func mustEnv(name string) string {
@@ -166,14 +154,6 @@ func main() {
 		o.UsePathStyle = true
 		o.BaseEndpoint = aws.String(*endpoint)
 		o.HTTPClient = httpClient
-		// Disable aws-chunked / STREAMING-AWS4-HMAC-SHA256-PAYLOAD by using
-		// SDK-native UNSIGNED-PAYLOAD: SigV4 signs headers only, body hash
-		// is the literal string "UNSIGNED-PAYLOAD". No proxy or server that
-		// touches the body will trigger SignatureDoesNotMatch, and s3proxy
-		// + GCS XML API both accept it.
-		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
-		o.APIOptions = append(o.APIOptions, forceUnsignedPayload)
 	})
 
 	payload := make([]byte, *payloadBytes)
