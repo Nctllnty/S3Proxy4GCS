@@ -1,0 +1,90 @@
+# Pressure Job template for the DNS-cutting workflow (Go V2 only).
+#
+# One Job per (PHASE, OP) — 4 total across a full run:
+#   Phase A: PUT, GET
+#   Phase C: PUT, GET
+#
+# The workflow substitutes __TOKEN__ placeholders via `sed` before apply.
+# Running inside the cluster is important: pods resolve `s3proxy.lb.local`
+# via the cluster-internal DNS view, so Phase A hits internal ALB and
+# Phase C hits CNAME -> storage.googleapis.com without any hosts hacks.
+#
+# Required substitutions:
+#   __JOB_NAME__        unique per Job (<=52 chars)
+#   __IMAGE__           fully-qualified pressure image
+#   __OP__              "get" | "put"
+#   __PHASE__           "A" | "C"
+#   __DURATION__        Go duration string, e.g. "2m"
+#   __CONCURRENCY__     integer, e.g. "2"
+#   __PAYLOAD_BYTES__   integer, e.g. "1024"
+#   __TEST_PREFIX__     key prefix, e.g. "dns-cut-<run_id>/"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  namespace: s3proxy-e2e
+  labels:
+    app: s3proxy-pressure
+    sdk: go-v2
+    op: __OP__
+    phase: phase-__PHASE__
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app: s3proxy-pressure
+        sdk: go-v2
+        op: __OP__
+        phase: phase-__PHASE__
+    spec:
+      serviceAccountName: s3proxy
+      nodeSelector:
+        cloud.google.com/gke-nodepool: benchmark-c4-pool-new
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: s3proxy
+              topologyKey: kubernetes.io/hostname
+      restartPolicy: Never
+      containers:
+        - name: pressure
+          image: __IMAGE__
+          args:
+            - "-op=__OP__"
+            - "-phase=__PHASE__"
+            - "-duration=__DURATION__"
+            - "-concurrency=__CONCURRENCY__"
+            - "-payload-bytes=__PAYLOAD_BYTES__"
+            - "-endpoint=http://s3proxy.lb.local"
+            - "-bucket=$(TEST_BUCKET)"
+            - "-prefix=__TEST_PREFIX__"
+            - "-sdk=go-v2"
+            - "-output=/tmp/pressure_report.json"
+          env:
+            - name: GCS_HMAC_ACCESS
+              valueFrom:
+                secretKeyRef:
+                  name: s3proxy-credentials
+                  key: PROXY_AWS_ACCESS_KEY_ID
+            - name: GCS_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: s3proxy-credentials
+                  key: PROXY_AWS_SECRET_ACCESS_KEY
+            - name: TEST_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: s3proxy-config
+                  key: TARGET_BUCKET
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"

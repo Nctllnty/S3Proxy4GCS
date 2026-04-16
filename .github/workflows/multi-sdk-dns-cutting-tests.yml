@@ -1,0 +1,389 @@
+name: multi-sdk-dns-cutting-tests
+
+# DNS Cut-over Test (Go V2 only, scope per Clement 2026-04-16)
+# ============================================================
+# Validates that switching the internal DNS record for `s3proxy.lb.local.`
+# from an A record (-> internal ALB / s3proxy service) to a CNAME
+# (-> storage.googleapis.com.) does NOT change observable GET/PUT
+# behaviour seen by AWS SDK Go V2.
+#
+# Three load phases + one report phase:
+#   Phase A  Pre-cut baseline.  In-cluster Go V2 worker @ concurrency=2:
+#              2-minute PUT loop, then 2-minute GET loop. Emit JSON.
+#   Phase B  DNS cut.            Cloud DNS transaction:
+#              - remove A   s3proxy.lb.local. -> <baseline_ip>
+#              - add    CNAME s3proxy.lb.local. -> storage.googleapis.com.
+#              Poll change_id until status=done, then sleep 30s for client
+#              resolver cache settle. Records UTC + GMT+8 timestamps.
+#   Phase C  Post-cut validation. Same load profile as Phase A.
+#   Phase D  Report.            Aggregate Phase A vs C JSONs into a Markdown
+#              report (GitHub step summary) + JSON artifact.
+#
+# Pressure jobs run inside the cluster as K8s Jobs, so the DNS resolution
+# path is the real one — Phase A hits internal ALB, Phase C hits the
+# CNAME -> GCS — without any runner-local /etc/hosts hacks.
+#
+# This workflow does NOT build/deploy s3proxy. It assumes namespace
+# `s3proxy-e2e` is already healthy (same assumption as benchmark.yml).
+#
+# Required GitHub repo secrets:
+#   GCP_SA_KEY                JSON SA key. Must hold (at minimum):
+#                               - roles/container.developer  (GKE read+apply)
+#                               - roles/dns.admin (or equivalent custom:
+#                                 dns.changes.create, dns.resourceRecordSets.{list,create,delete},
+#                                 dns.changes.get)
+#                               - roles/artifactregistry.writer (push pressure image)
+#   GCS_HMAC_ACCESS / GCS_HMAC_SECRET / TEST_BUCKET   (existing secrets)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dns_zone:
+        description: "Cloud DNS managed-zone resource name (NOT the FQDN). e.g. lb-local-internal"
+        required: true
+      baseline_ip:
+        description: "A-record IP currently behind s3proxy.lb.local (internal ALB reserved IP). e.g. 10.142.0.14"
+        required: true
+      skip_cutover:
+        description: "Dry-run: run only Phase A (true|false)"
+        required: false
+        default: "false"
+      run_rollback:
+        description: "After Phase C, rollback DNS to the A record (true|false)"
+        required: false
+        default: "true"
+
+env:
+  GKE_CLUSTER: s3proxy-e2e
+  GKE_REGION: us-east1
+  GCP_PROJECT: cbs-poctest
+  GAR_REGISTRY: us-east1-docker.pkg.dev/cbs-poctest/s3proxy
+  K8S_NAMESPACE: s3proxy-e2e
+  # Hard-coded per Clement 2026-04-16:
+  DNS_NAME: "s3proxy.lb.local."
+  CUTOVER_TARGET: "storage.googleapis.com."
+  PRESSURE_DURATION: "2m"
+  PRESSURE_CONCURRENCY: "2"
+  PRESSURE_PAYLOAD_BYTES: "1024"
+  POST_CHANGE_SLEEP: "30"
+  DNS_TTL: "60"
+
+jobs:
+  # ================================================================
+  # 0. Preflight
+  # ================================================================
+  preflight:
+    name: Preflight (cluster + DNS describe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      pressure_image: ${{ steps.images.outputs.image }}
+      run_prefix: ${{ steps.meta.outputs.prefix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "prefix=dns-cut-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - id: images
+        run: echo "image=${{ env.GAR_REGISTRY }}/s3proxy-pressure-go-v2:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Health-check cluster
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+            --region ${{ env.GKE_REGION }} --project ${{ env.GCP_PROJECT }}
+          kubectl get ns ${{ env.K8S_NAMESPACE }}
+          kubectl -n ${{ env.K8S_NAMESPACE }} rollout status deploy/s3proxy --timeout=60s
+
+      - name: Describe current DNS state
+        env:
+          DNS_PROJECT: ${{ env.GCP_PROJECT }}
+          DNS_ZONE: ${{ inputs.dns_zone }}
+          DNS_NAME: ${{ env.DNS_NAME }}
+          MODE: describe
+        run: bash scripts/dns_cut.sh
+
+  # ================================================================
+  # 1. Build pressure image
+  # ================================================================
+  build-image:
+    name: Build Pressure Image (go-v2)
+    runs-on: ubuntu-latest
+    needs: preflight
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-east1-docker.pkg.dev --quiet
+
+      - name: Build & push pressure image
+        run: |
+          IMAGE="${{ needs.preflight.outputs.pressure_image }}"
+          docker build -t "$IMAGE" sdk_tests/go-v2/pressure/
+          docker push "$IMAGE"
+
+  # ================================================================
+  # 2. Phase A — pre-cut baseline (PUT then GET, each 2 min @ conc 2)
+  # ================================================================
+  phase-a:
+    name: "Phase A — Pre-cut Baseline"
+    runs-on: ubuntu-latest
+    needs: [preflight, build-image]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Get GKE Credentials
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+            --region ${{ env.GKE_REGION }} --project ${{ env.GCP_PROJECT }}
+
+      - name: Run pressure jobs (PUT then GET)
+        env:
+          PHASE: A
+          IMAGE: ${{ needs.preflight.outputs.pressure_image }}
+          RUN_PREFIX: ${{ needs.preflight.outputs.run_prefix }}
+          DURATION: ${{ env.PRESSURE_DURATION }}
+          CONCURRENCY: ${{ env.PRESSURE_CONCURRENCY }}
+          PAYLOAD_BYTES: ${{ env.PRESSURE_PAYLOAD_BYTES }}
+        run: bash scripts/run_pressure_phase.sh
+
+      - name: Upload Phase A artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pressure-phase-a
+          path: results/phase-A/
+          if-no-files-found: warn
+
+  # ================================================================
+  # 3. Phase B — DNS cut
+  # ================================================================
+  phase-b-dns-cut:
+    name: "Phase B — DNS Cut"
+    runs-on: ubuntu-latest
+    needs: [preflight, phase-a]
+    if: ${{ inputs.skip_cutover != 'true' }}
+    timeout-minutes: 15
+    outputs:
+      change_id: ${{ steps.cut.outputs.change_id }}
+      start_utc: ${{ steps.cut.outputs.start_utc }}
+      start_cst: ${{ steps.cut.outputs.start_cst }}
+      complete_utc: ${{ steps.cut.outputs.complete_utc }}
+      complete_cst: ${{ steps.cut.outputs.complete_cst }}
+      elapsed_sec: ${{ steps.cut.outputs.elapsed_sec }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Get GKE Credentials
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+            --region ${{ env.GKE_REGION }} --project ${{ env.GCP_PROJECT }}
+
+      - id: cut
+        name: Execute DNS cut (A -> CNAME -> storage.googleapis.com.)
+        env:
+          DNS_PROJECT: ${{ env.GCP_PROJECT }}
+          DNS_ZONE: ${{ inputs.dns_zone }}
+          DNS_NAME: ${{ env.DNS_NAME }}
+          CUTOVER_TARGET: ${{ env.CUTOVER_TARGET }}
+          MODE: cutover
+          TTL: ${{ env.DNS_TTL }}
+          POST_CHANGE_SLEEP: ${{ env.POST_CHANGE_SLEEP }}
+        run: |
+          set -euo pipefail
+          OUT="$(bash scripts/dns_cut.sh)"
+          echo "$OUT"
+          parse() { echo "$OUT" | grep -E "^DNS_EVENT=$1 " | head -1 | sed -E "s/.*$2=([^ ]+).*/\\1/"; }
+          START_UTC="$(parse start at)"
+          START_CST="$(parse start at_cst)"
+          COMPLETE_UTC="$(parse complete at)"
+          COMPLETE_CST="$(parse complete at_cst)"
+          ELAPSED="$(parse complete elapsed_sec)"
+          CHANGE_ID="$(echo "$OUT" | grep '^DNS_EVENT=change_id ' | head -1 | sed -E 's/.*id=([^ ]+).*/\1/' || true)"
+          {
+            echo "start_utc=${START_UTC}"
+            echo "start_cst=${START_CST}"
+            echo "complete_utc=${COMPLETE_UTC}"
+            echo "complete_cst=${COMPLETE_CST}"
+            echo "elapsed_sec=${ELAPSED}"
+            echo "change_id=${CHANGE_ID:-}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify DNS view from inside the cluster
+        run: |
+          kubectl run dns-verify --rm -i --restart=Never \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --image=busybox:1.36 \
+            -- sh -c "nslookup ${{ env.DNS_NAME }}; echo '---'; nslookup s3proxy.lb.local" \
+            || true
+
+  # ================================================================
+  # 4. Phase C — post-cut validation
+  # ================================================================
+  phase-c:
+    name: "Phase C — Post-cut Validation"
+    runs-on: ubuntu-latest
+    needs: [preflight, phase-b-dns-cut]
+    if: ${{ inputs.skip_cutover != 'true' }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Get GKE Credentials
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+            --region ${{ env.GKE_REGION }} --project ${{ env.GCP_PROJECT }}
+
+      - name: Run pressure jobs (PUT then GET)
+        env:
+          PHASE: C
+          IMAGE: ${{ needs.preflight.outputs.pressure_image }}
+          RUN_PREFIX: ${{ needs.preflight.outputs.run_prefix }}
+          DURATION: ${{ env.PRESSURE_DURATION }}
+          CONCURRENCY: ${{ env.PRESSURE_CONCURRENCY }}
+          PAYLOAD_BYTES: ${{ env.PRESSURE_PAYLOAD_BYTES }}
+        run: bash scripts/run_pressure_phase.sh
+
+      - name: Upload Phase C artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pressure-phase-c
+          path: results/phase-C/
+          if-no-files-found: warn
+
+  # ================================================================
+  # 5. Phase D — aggregate report
+  # ================================================================
+  report:
+    name: Aggregate Cut-over Report
+    runs-on: ubuntu-latest
+    needs: [preflight, phase-a, phase-b-dns-cut, phase-c]
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Phase A artifacts
+        if: needs.phase-a.result == 'success' || needs.phase-a.result == 'failure'
+        uses: actions/download-artifact@v4
+        with:
+          name: pressure-phase-a
+          path: results/phase-A
+        continue-on-error: true
+
+      - name: Download Phase C artifacts
+        if: needs.phase-c.result == 'success' || needs.phase-c.result == 'failure'
+        uses: actions/download-artifact@v4
+        with:
+          name: pressure-phase-c
+          path: results/phase-C
+        continue-on-error: true
+
+      - name: Write DNS event metadata
+        run: |
+          mkdir -p results
+          cat > results/dns_event.env <<EOF
+          DNS_NAME=${{ env.DNS_NAME }}
+          DNS_ZONE=${{ inputs.dns_zone }}
+          CUTOVER_TARGET=${{ env.CUTOVER_TARGET }}
+          BASELINE_IP=${{ inputs.baseline_ip }}
+          DNS_CHANGE_ID=${{ needs.phase-b-dns-cut.outputs.change_id }}
+          DNS_CUT_START_UTC=${{ needs.phase-b-dns-cut.outputs.start_utc }}
+          DNS_CUT_START_CST=${{ needs.phase-b-dns-cut.outputs.start_cst }}
+          DNS_CUT_COMPLETE_UTC=${{ needs.phase-b-dns-cut.outputs.complete_utc }}
+          DNS_CUT_COMPLETE_CST=${{ needs.phase-b-dns-cut.outputs.complete_cst }}
+          DNS_CUT_ELAPSED_SEC=${{ needs.phase-b-dns-cut.outputs.elapsed_sec }}
+          SKIP_CUTOVER=${{ inputs.skip_cutover }}
+          EOF
+          cat results/dns_event.env
+
+      - name: Aggregate report
+        run: |
+          mkdir -p report-out
+          python3 scripts/aggregate_pressure_report.py results report-out
+
+      - name: Publish Markdown summary
+        run: cat report-out/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dns-cut-report
+          path: |
+            report-out/report.md
+            report-out/report.json
+            report-out/summary.md
+            results/dns_event.env
+          if-no-files-found: warn
+
+  # ================================================================
+  # 6. Optional rollback (always() so DNS gets restored even on failure)
+  # ================================================================
+  rollback:
+    name: "Rollback DNS (restore A record)"
+    runs-on: ubuntu-latest
+    needs: [phase-b-dns-cut, phase-c]
+    if: ${{ always() && inputs.skip_cutover != 'true' && inputs.run_rollback == 'true' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Restore baseline A record
+        env:
+          DNS_PROJECT: ${{ env.GCP_PROJECT }}
+          DNS_ZONE: ${{ inputs.dns_zone }}
+          DNS_NAME: ${{ env.DNS_NAME }}
+          BASELINE_IP: ${{ inputs.baseline_ip }}
+          MODE: rollback
+          TTL: ${{ env.DNS_TTL }}
+          POST_CHANGE_SLEEP: ${{ env.POST_CHANGE_SLEEP }}
+        run: bash scripts/dns_cut.sh
