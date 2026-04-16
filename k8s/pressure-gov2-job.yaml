@@ -60,7 +60,7 @@ spec:
             - "-duration=__DURATION__"
             - "-concurrency=__CONCURRENCY__"
             - "-payload-bytes=__PAYLOAD_BYTES__"
-            - "-endpoint=http://s3proxy.lb.local"
+            - "-endpoint=http://s3proxy.lb.local:8080"
             - "-bucket=$(TEST_BUCKET)"
             - "-prefix=__TEST_PREFIX__"
             - "-sdk=go-v2"
