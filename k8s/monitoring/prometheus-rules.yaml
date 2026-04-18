@@ -1,0 +1,115 @@
+# PrometheusRule for s3proxy4gcs.
+#
+# These alerts codify the baseline SLOs described in docs/SLO.md:
+#   * Data-plane availability  >= 99.9%    (5xx rate alert @ 0.5%)
+#   * Data-plane tail latency  P99 < 1s    (get_object / put_object)
+#   * Control-plane stability  No 5xx      (lifecycle/cors/logging/website/tagging)
+#   * Throttle saturation      In-flight   (concurrency limiter headroom)
+#   * GCS backend health       SDK errors  (control-plane GCS SDK failures)
+#
+# Labels mirror the ServiceMonitor (namespace s3proxy-e2e, app s3proxy) so
+# alerts route to the same team that owns the proxy.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: s3proxy-rules
+  namespace: s3proxy-e2e
+  labels:
+    app: s3proxy
+    # Matches the kube-prometheus-stack Prometheus CR default selector.
+    release: monitoring
+spec:
+  groups:
+    - name: s3proxy.slo
+      interval: 30s
+      rules:
+        # --- Data-plane availability -----------------------------------
+        - alert: S3ProxyDataPlane5xxRateHigh
+          expr: |
+            sum by (endpoint) (
+              rate(s3proxy_gcs_errors_total{endpoint=~"get_object|put_object|head_object|delete_object|list_objects|delete_objects", status_class="5xx"}[5m])
+            )
+            /
+            sum by (endpoint) (
+              rate(s3proxy_http_requests_total{endpoint=~"get_object|put_object|head_object|delete_object|list_objects|delete_objects"}[5m])
+            )
+            > 0.005
+          for: 5m
+          labels:
+            severity: critical
+            slo: data-plane-availability
+          annotations:
+            summary: "S3Proxy data-plane 5xx > 0.5% on {{ $labels.endpoint }}"
+            description: |
+              More than 0.5% of requests on `{{ $labels.endpoint }}` returned 5xx
+              for 5 consecutive minutes. Check `s3proxy_gcs_errors_total` by
+              endpoint + status_class, and upstream GCS status.
+            runbook: https://github.com/s3proxy4gcs/runbooks/5xx.md
+
+        # --- Data-plane tail latency -----------------------------------
+        - alert: S3ProxyDataPlaneP99Slow
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le, endpoint) (
+                rate(s3proxy_http_request_duration_seconds_bucket{endpoint=~"get_object|put_object"}[10m])
+              )
+            ) > 1
+          for: 10m
+          labels:
+            severity: warning
+            slo: data-plane-latency
+          annotations:
+            summary: "S3Proxy P99 latency > 1s on {{ $labels.endpoint }}"
+            description: |
+              P99 latency for `{{ $labels.endpoint }}` has exceeded 1s for
+              10 minutes. Inspect SigV4 overhead (`s3proxy_resign_duration_seconds`),
+              GCS latency (`s3proxy_gcs_api_duration_seconds`), and pod CPU throttling.
+
+        # --- Control-plane GCS SDK failures ----------------------------
+        - alert: S3ProxyControlPlaneGCSErrors
+          expr: |
+            sum by (operation, status_class) (
+              rate(s3proxy_gcs_errors_total{status_class=~"5xx|timeout|network"}[5m])
+            ) > 0
+          for: 5m
+          labels:
+            severity: warning
+            slo: control-plane-availability
+          annotations:
+            summary: "S3Proxy control-plane errors on {{ $labels.operation }} ({{ $labels.status_class }})"
+            description: |
+              SDK calls for `{{ $labels.operation }}` are failing with
+              `{{ $labels.status_class }}`. Most common causes: GCS regional
+              outage, HMAC key rotation, or IAM binding drift.
+
+        # --- Throttle saturation ---------------------------------------
+        - alert: S3ProxyThrottleSaturated
+          expr: |
+            sum by (pod) (s3proxy_in_flight_requests)
+            /
+            scalar(max(s3proxy_in_flight_requests) or vector(1000))
+            > 0.8
+          for: 2m
+          labels:
+            severity: warning
+            slo: capacity
+          annotations:
+            summary: "S3Proxy in-flight >80% of throttle ceiling"
+            description: |
+              In-flight requests are saturating the concurrency limiter.
+              Scale replicas via HPA or bump MAX_CONCURRENT_REQUESTS after
+              verifying that long-running PUT streams are not monopolizing slots.
+
+        # --- Proxy process health --------------------------------------
+        - alert: S3ProxyInstanceDown
+          expr: up{job=~"s3proxy.*"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            slo: availability
+          annotations:
+            summary: "S3Proxy scrape target down"
+            description: |
+              Prometheus cannot scrape `/metrics` for 2 minutes. Check the pod
+              (liveness probe, OOMKill), node, and ServiceMonitor selector.

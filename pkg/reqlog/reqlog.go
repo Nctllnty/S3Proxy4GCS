@@ -61,6 +61,9 @@ func (rec Record) ToCSVLine() string {
 }
 
 // statusRecorder wraps http.ResponseWriter to capture the response status code.
+//
+// Unwrap() and Flush() are exposed so http.ResponseController (used by
+// httputil.ReverseProxy for streaming flush) can reach the real writer.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -69,6 +72,18 @@ type statusRecorder struct {
 func (sr *statusRecorder) WriteHeader(code int) {
 	sr.status = code
 	sr.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap lets http.ResponseController traverse to the real ResponseWriter.
+func (sr *statusRecorder) Unwrap() http.ResponseWriter {
+	return sr.ResponseWriter
+}
+
+// Flush proxies to the underlying writer's Flusher for streaming responses.
+func (sr *statusRecorder) Flush() {
+	if f, ok := sr.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // Middleware returns a Chi-compatible middleware that logs each request to logger

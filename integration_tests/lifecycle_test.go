@@ -18,8 +18,14 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// 1. Build the proxy binary from the root
-	buildCmd := exec.Command("/usr/local/go/bin/go", "build", "-o", "s3proxy4gcs_test_bin", ".")
+	// 1. Build the proxy binary from the root.
+	// Resolve `go` from PATH so the harness works on dev machines where
+	// the toolchain lives outside /usr/local/go (e.g. Homebrew on macOS).
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		log.Fatalf("Failed to locate `go` in PATH: %v", err)
+	}
+	buildCmd := exec.Command(goBin, "build", "-o", "s3proxy4gcs_test_bin", ".")
 	buildCmd.Dir = "../"
 	if err := buildCmd.Run(); err != nil {
 		log.Fatalf("Failed to build proxy binary: %v", err)

@@ -31,6 +31,11 @@ type Settings struct {
 	JSONKey               string        // Path to GCS Service Account JSON key
 	ProxyBaseDomain       string        // Base domain for virtual-hosted style support
 
+	// PPROFAddr controls the optional pprof profiling endpoint. Empty (default)
+	// keeps it disabled; set e.g. "127.0.0.1:6060" to expose runtime profiles
+	// on an independent port. MUST NOT be exposed publicly.
+	PPROFAddr string
+
 	// Request data logging (SOH-delimited CSV file via ymlog)
 	ReqLogEnabled   bool   // REQUEST_LOG_ENABLED,      default true
 	ReqLogPath      string // REQUEST_LOG_PATH,          default "./logs/req_%Y%M%D.csv"
@@ -175,6 +180,7 @@ func LoadConfig() {
 		ProxySecretKey:        getEnv("PROXY_AWS_SECRET_ACCESS_KEY", getEnv("AWS_SECRET_ACCESS_KEY", "")),
 		JSONKey:               getEnv("JSON_KEY", ""),
 		ProxyBaseDomain:       getEnv("PROXY_BASE_DOMAIN", ""),
+		PPROFAddr:             getEnv("PPROF_ADDR", ""),
 		ReqLogEnabled:         reqLogEnabled,
 		ReqLogPath:            getEnv("REQUEST_LOG_PATH", "./logs/req_%Y%M%D.csv"),
 		ReqLogMaxSizeMB:       reqLogMaxSizeMB,

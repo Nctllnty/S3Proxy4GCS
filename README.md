@@ -33,6 +33,7 @@ Available Configuration Options:
 -   `RESPONSE_HEADER_TIMEOUT_SEC` (Default: `30`): Maximum time to wait for GCS response headers. Protects against slow backend responses.
 -   `READ_BUFFER_SIZE` (Default: `65536`): TCP read buffer size (bytes) for the GET/HEAD read-path Transport. Larger values improve download throughput for large objects.
 -   `WRITE_BUFFER_SIZE` (Default: `65536`): TCP write buffer size (bytes) for the PUT/POST/DELETE write-path Transport. Larger values improve upload throughput for large objects.
+-   `PPROF_ADDR` (Default: empty / disabled): Bind address for the optional `net/http/pprof` profiling endpoint (e.g. `127.0.0.1:6060`). Uses a dedicated listener so runtime profiles never compete with or leak through the main data-plane port. Enable only for diagnostics.
 
 ## Alternative: Transparent Routing via HTTP_PROXY
 
@@ -128,8 +129,9 @@ graph TB
 - **Multi-Object Delete**: Fully supports bulk `DeleteObjects` using standard S3 XML payloads routed directly to GCS's native XML API via HMAC re-signing.
 - **Lifecycle Intercept**: Translates S3 XML Lifecycle Configuration to GCS JSON.
 - **Real GCS Forwarding**: Submits translated JSON to GCS via official GCS Go SDK.
-- **Structured JSON Logging**: Native `log/slog` for modern cloud observability (Parsable JSON lines). Toggle `DEBUG_LOGGING=true` for verbose output.
-- **Prometheus Metrics**: Request counts, latency histograms, GCS API call duration at `/metrics`.
+- **Structured JSON Logging**: Native `log/slog` for modern cloud observability (Parsable JSON lines). Production default `DEBUG_LOGGING=false` emits exactly 2 log lines per data-plane request (`Received S3 Request` + `HTTP request completed`); `DEBUG_LOGGING=true` enables full header / signing traces for diagnostics only. Chi's plain-text access log middleware is intentionally disabled to avoid duplicate records.
+- **Prometheus Metrics**: Request counts, latency histograms, GCS API call duration at `/metrics`. Control-plane operations (`lifecycle` / `cors` / `logging` / `website` / `tagging`) and `delete_objects` are reported as dedicated endpoint labels. Additional v1.3 series: `s3proxy_in_flight_requests`, `s3proxy_resign_duration_seconds`, `s3proxy_gcs_errors_total{status_class}`. See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) and [`docs/SLO.md`](docs/SLO.md).
+- **Runtime Profiling**: Optional pprof endpoint. Set `PPROF_ADDR=127.0.0.1:6060` to enable (bound to a separate listener, never exposed through the main port or LoadBalancer).
 - **Reliable Timeouts**: Set timeouts on `http.Transport` to prevent hanging connections.
 - **Graceful Shutdown**: Listens for `SIGTERM`/`SIGINT` and waits up to 10s for draining requests.
 - **Prefix Isolation**: Use `GCS_PREFIX` for test isolation.

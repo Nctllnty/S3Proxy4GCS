@@ -130,11 +130,12 @@ The proxy has been validated against **6 AWS SDKs** with full data-plane and con
 #### 7. Storage Classes
 **Issue**: GCS rejects AWS-specific storage class values (e.g., `STANDARD_IA`, `GLACIER`).
 **Solution (Validated)**: The proxy transparently translates AWS storage classes to GCS equivalents before forwarding:
+- `STANDARD` / `REDUCED_REDUNDANCY` -> `STANDARD`
 - `STANDARD_IA` / `ONEZONE_IA` -> `NEARLINE`
 - `GLACIER_IR` (Instant Retrieval) -> `COLDLINE`
 - `GLACIER` / `DEEP_ARCHIVE` -> `ARCHIVE`
 - `INTELLIGENT_TIERING` -> `AUTOCLASS`
-- Standard falls back to `STANDARD`.
+- Any other value -> `400 InvalidStorageClass` (v1.4+ change; previously silently remapped to `NEARLINE`, which violated AGENTS rule 4).
 
 #### 8. Versioning (ListObjectVersions / HeadObject)
 **Issue**: GCS uses `<Generation>` instead of `<VersionId>`.

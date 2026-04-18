@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	_ "net/http/pprof" // pprof handlers registered into http.DefaultServeMux, exposed on PPROFAddr when set.
 	"net/url"
 	"os"
 	"os/signal"
@@ -32,6 +34,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 
 	"s3proxy4gcs/pkg/reqlog"
@@ -81,6 +84,16 @@ func main() {
 	slog.SetDefault(logger)
 
 	gcsCtx = context.Background()
+
+	// Fail-fast on missing HMAC re-sign credentials in live mode.
+	// Without them the proxy would forward unsigned requests to GCS,
+	// triggering 100% 403 rates that are time-consuming to diagnose
+	// in production.
+	if !config.Config.DryRun {
+		if config.Config.ProxyAccessKey == "" || config.Config.ProxySecretKey == "" {
+			log.Fatal("FATAL: PROXY_AWS_ACCESS_KEY_ID / PROXY_AWS_SECRET_ACCESS_KEY are required when DRY_RUN=false. Set them via env or .env to avoid silent SignatureDoesNotMatch loops.")
+		}
+	}
 
 	var err error
 	if !config.Config.DryRun {
@@ -183,9 +196,11 @@ func main() {
 					if req.URL.RawPath != "" {
 						req.URL.RawPath = "/" + bucket + req.URL.RawPath
 					}
-					slog.Info("Virtual-hosted to path-style conversion",
-						"bucket", bucket,
-						"rewrittenPath", req.URL.Path)
+					if config.Config.DebugLogging {
+						slog.Debug("Virtual-hosted to path-style conversion",
+							"bucket", bucket,
+							"rewrittenPath", req.URL.Path)
+					}
 				}
 			}
 		}
@@ -213,22 +228,15 @@ func main() {
 
 		sc := req.Header.Get("x-amz-storage-class")
 		if sc != "" && sc != "STANDARD" {
-			slog.Info("Detected non-standard S3 Storage Class", "storageClass", sc)
-			switch sc {
-			case "STANDARD_IA":
-				req.Header.Set("x-amz-storage-class", "NEARLINE")
-				shouldResign = true
-			case "GLACIER_IR":
-				req.Header.Set("x-amz-storage-class", "COLDLINE")
-				shouldResign = true
-			case "GLACIER", "DEEP_ARCHIVE":
-				req.Header.Set("x-amz-storage-class", "ARCHIVE")
-				shouldResign = true
-			case "INTELLIGENT_TIERING":
-				req.Header.Set("x-amz-storage-class", "AUTOCLASS")
-				shouldResign = true
-			default:
-				req.Header.Set("x-amz-storage-class", "NEARLINE") // "The Others"
+			if config.Config.DebugLogging {
+				slog.Debug("Detected non-standard S3 Storage Class", "storageClass", sc)
+			}
+			// Translation table: S3 -> GCS. Entries must stay in sync with
+			// `isKnownS3StorageClass` below. Unknown values are rejected at
+			// the handler entry point (handleS3Request) before we get here.
+			gcsSC, known := translateS3StorageClass(sc)
+			if known {
+				req.Header.Set("x-amz-storage-class", gcsSC)
 				shouldResign = true
 			}
 		}
@@ -236,7 +244,9 @@ func main() {
 		// Detect x-id query parameter (Go SDK v2 specific tracking)
 		q := req.URL.Query()
 		if q.Get("x-id") != "" {
-			slog.Info("Detected x-id query parameter. Stripping and re-signing", "xId", q.Get("x-id"))
+			if config.Config.DebugLogging {
+				slog.Debug("Detected x-id query parameter. Stripping and re-signing", "xId", q.Get("x-id"))
+			}
 			q.Del("x-id")
 			req.URL.RawQuery = q.Encode()
 			shouldResign = true
@@ -244,7 +254,9 @@ func main() {
 
 		// Detect Accept-Encoding: identity (causes issues with GCS S3 API)
 		if req.Header.Get("Accept-Encoding") == "identity" {
-			slog.Info("Detected Accept-Encoding: identity. Stripping and re-signing")
+			if config.Config.DebugLogging {
+				slog.Debug("Detected Accept-Encoding: identity. Stripping and re-signing")
+			}
 			req.Header.Del("Accept-Encoding")
 			shouldResign = true
 		}
@@ -288,9 +300,11 @@ func main() {
 						req.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(h.Sum(nil)))
 						req.Body = io.NopCloser(&buf)
 						req.ContentLength = int64(buf.Len())
-						slog.Info("Computed Content-MD5 for POST ?delete",
-							"bodyLen", buf.Len(),
-							"md5", req.Header.Get("Content-Md5"))
+						if config.Config.DebugLogging {
+							slog.Debug("Computed Content-MD5 for POST ?delete",
+								"bodyLen", buf.Len(),
+								"md5", req.Header.Get("Content-Md5"))
+						}
 					}
 				} else {
 					req.Header.Del("Content-Md5")
@@ -303,19 +317,20 @@ func main() {
 					}
 				}
 
-				if err := signer.SignHTTP(req.Context(), awsCreds, req, payloadHash, "s3", "us-east-1", time.Now()); err != nil {
-					slog.Error("Failed to re-sign request", "error", err)
-				} else {
-					// Log the signed headers for debugging signature issues
-					authHeader := req.Header.Get("Authorization")
-					slog.Info("Successfully re-signed request for GCS",
+				signStart := time.Now()
+				signErr := signer.SignHTTP(req.Context(), awsCreds, req, payloadHash, "s3", "us-east-1", time.Now())
+				metrics.ResignDurationSeconds.Observe(time.Since(signStart).Seconds())
+				if signErr != nil {
+					slog.Error("Failed to re-sign request", "error", signErr)
+				} else if config.Config.DebugLogging {
+					// Debug-only: signed request trace. Authorization intentionally redacted.
+					slog.Debug("Successfully re-signed request for GCS",
 						"method", req.Method,
 						"url", req.URL.String(),
 						"host", req.Host,
 						"content-length", req.ContentLength,
 						"content-type", req.Header.Get("Content-Type"),
 						"x-amz-sha256", req.Header.Get("X-Amz-Content-Sha256"),
-						"authorization", authHeader,
 					)
 				}
 			}
@@ -327,22 +342,23 @@ func main() {
 			slog.Debug("Response Headers received from GCS", "headers", resp.Header)
 		}
 
-		// Log 4xx/5xx errors from GCS for debugging
+		// Log 4xx/5xx errors from GCS for debugging.
+		// Do NOT read the body: many 4xx are normal (HeadObject 404,
+		// GetObjectTagging 403). Reading the body here breaks streaming
+		// and wastes allocations on the hot path. The status code and URL
+		// are enough; detailed error bodies are visible to clients anyway.
 		if resp.StatusCode >= 400 {
-			// Read response body for error details, then restore it
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			slog.Warn("GCS returned error",
 				"status", resp.StatusCode,
 				"method", resp.Request.Method,
 				"url", resp.Request.URL.String(),
-				"error_body", string(bodyBytes[:min(len(bodyBytes), 500)]),
 			)
 		}
 
-		// Read and log XML response if requested for version interop
-		if strings.Contains(resp.Request.URL.RawQuery, "versions") {
+		// Debug-only: full XML dump for ListObjectVersions. Guarded by
+		// DebugLogging — otherwise we must NOT ReadAll, since the body
+		// can be multi-MB on buckets with large version histories.
+		if config.Config.DebugLogging && strings.Contains(resp.Request.URL.RawQuery, "versions") {
 			if bodyBytes, err := io.ReadAll(resp.Body); err == nil {
 				slog.Debug("XML Response Body for ListObjectVersions", "xml", string(bodyBytes))
 				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -352,7 +368,9 @@ func main() {
 		// 3. Versioning Interop (Ingress)
 		if gen := resp.Header.Get("x-goog-generation"); gen != "" {
 			resp.Header.Set("x-amz-version-id", gen)
-			slog.Info("Mapped x-goog-generation to x-amz-version-id", "generation", gen)
+			if config.Config.DebugLogging {
+				slog.Debug("Mapped x-goog-generation to x-amz-version-id", "generation", gen)
+			}
 		}
 
 		return nil
@@ -366,12 +384,16 @@ func main() {
 
 	r := chi.NewRouter()
 
-	// Base middlewares
+	// Base middlewares.
+	//
+	// chi's default middleware.Logger is intentionally NOT used: it emits
+	// plain-text access logs that duplicate observabilityMiddleware's
+	// structured JSON output. Dropping it cuts ~30% of per-request log
+	// bytes at high QPS (and the matching Cloud Logging cost).
 	r.Use(middleware.RequestID)
 	if config.Config.ReqLogEnabled {
 		r.Use(reqlog.Middleware(reqlog.Default))
 	}
-	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	// metrics.WithMetrics records bytes/size/count/duration for every proxy
 	// request. Placed before observability logging so status codes are captured
@@ -452,6 +474,27 @@ func main() {
 
 	serverErrors := make(chan error, 1)
 
+	// Optional pprof endpoint on a dedicated port.
+	//
+	// net/http/pprof registers its handlers onto http.DefaultServeMux in
+	// its init(); we expose that mux on a SEPARATE listener so profiling
+	// data never competes with data-plane traffic or leaks through the
+	// public LoadBalancer. Intended for cluster-local bind only
+	// (e.g. "127.0.0.1:6060"); operators port-forward to access.
+	if addr := config.Config.PPROFAddr; addr != "" {
+		go func() {
+			slog.Info("Starting pprof endpoint (DEBUG)", "addr", addr)
+			pprofSrv := &http.Server{
+				Addr:              addr,
+				Handler:           http.DefaultServeMux,
+				ReadHeaderTimeout: 10 * time.Second,
+			}
+			if err := pprofSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("pprof server exited", "error", err)
+			}
+		}()
+	}
+
 	go func() {
 		slog.Info("Starting S3 to GCS proxy", "port", config.Config.Port)
 		serverErrors <- srv.ListenAndServe()
@@ -480,6 +523,11 @@ func main() {
 }
 
 // statusRecorder wraps http.ResponseWriter to capture the status code.
+//
+// It exposes Unwrap() and Flush() so that httputil.ReverseProxy's use of
+// http.NewResponseController can walk through this wrapper to reach the
+// underlying http.Flusher. Without this, readProxy.FlushInterval = -1
+// silently fails and GET/HEAD streaming buffers at the proxy boundary.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -488,6 +536,20 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap lets http.ResponseController traverse to the real ResponseWriter
+// (Go 1.20+ convention).
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
+// Flush proxies to the underlying writer's Flusher implementation, enabling
+// immediate response flushing for streaming GET/HEAD downloads.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // observabilityMiddleware replaces chi's default Logger middleware with structured
@@ -537,6 +599,10 @@ func reqLogger(ctx context.Context) *slog.Logger {
 // timeGCSCall executes a GCS SDK call with an optional per-call timeout,
 // logs and records its duration. The fn receives a context that may have
 // a deadline applied (controlled by GCS_CALL_TIMEOUT_SEC, default 30s).
+//
+// On failure the call also records s3proxy_gcs_errors_total with a
+// status_class label derived from googleapi.Error or the standard ctx
+// cancellation / deadline reasons.
 func timeGCSCall(ctx context.Context, operation string, fn func(ctx context.Context) error) error {
 	callCtx := ctx
 	if config.Config.GCSCallTimeout > 0 {
@@ -551,16 +617,86 @@ func timeGCSCall(ctx context.Context, operation string, fn func(ctx context.Cont
 	metrics.GCSAPIDurationSeconds.WithLabelValues(operation).Observe(duration.Seconds())
 	log := reqLogger(ctx)
 	if err != nil {
-		log.Error("GCS API call failed", "operation", operation, "duration_ms", duration.Milliseconds(), "error", err)
+		class := classifyGCSSDKError(err)
+		metrics.GCSErrorsTotal.WithLabelValues(operation, class).Inc()
+		log.Error("GCS API call failed",
+			"operation", operation,
+			"duration_ms", duration.Milliseconds(),
+			"status_class", class,
+			"error", err)
 	} else {
 		log.Info("GCS API call succeeded", "operation", operation, "duration_ms", duration.Milliseconds())
 	}
 	return err
 }
 
+// classifyGCSSDKError maps a GCS SDK error into a low-cardinality label
+// suitable for s3proxy_gcs_errors_total{status_class=…}.
+func classifyGCSSDKError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var gErr *googleapi.Error
+	if errors.As(err, &gErr) {
+		if class := metrics.ClassifyGCSError(gErr.Code); class != "" {
+			return class
+		}
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return "network"
+	}
+}
+
+// translateS3StorageClass maps an S3 storage class to its GCS equivalent.
+// The second return value is false for values the proxy does not recognise;
+// callers MUST treat those as client errors (InvalidStorageClass).
+//
+// Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html
+func translateS3StorageClass(sc string) (string, bool) {
+	switch sc {
+	case "STANDARD", "REDUCED_REDUNDANCY":
+		// REDUCED_REDUNDANCY is deprecated on AWS and silently promoted
+		// to STANDARD. Match that behaviour so callers don't see surprise
+		// Class A cost increases.
+		return "STANDARD", true
+	case "STANDARD_IA", "ONEZONE_IA":
+		return "NEARLINE", true
+	case "GLACIER_IR":
+		return "COLDLINE", true
+	case "GLACIER", "DEEP_ARCHIVE":
+		return "ARCHIVE", true
+	case "INTELLIGENT_TIERING":
+		return "AUTOCLASS", true
+	default:
+		return "", false
+	}
+}
+
 func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	log := reqLogger(r.Context())
 	log.Info("Received S3 Request", "method", r.Method, "uri", r.RequestURI)
+
+	// Fail fast on unknown x-amz-storage-class values. Previously we
+	// silently remapped them to NEARLINE, which violated AGENTS rule 4
+	// ("Reject Unsupported") and risked placing hot data on cheaper tiers
+	// without the caller's knowledge. The Director still rewrites known
+	// values in-place for SigV4 continuity.
+	if sc := r.Header.Get("x-amz-storage-class"); sc != "" {
+		if _, ok := translateS3StorageClass(sc); !ok {
+			log.Warn("Rejecting unknown S3 storage class",
+				"storage_class", sc,
+				"method", r.Method,
+				"uri", r.RequestURI)
+			writeS3Error(w, http.StatusBadRequest, "InvalidStorageClass",
+				fmt.Sprintf("The storage class %q is not recognised. Supported values: STANDARD, REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA, GLACIER_IR, GLACIER, DEEP_ARCHIVE, INTELLIGENT_TIERING.", sc))
+			return
+		}
+	}
 
 	// Reject aws-chunked requests early.
 	// Modern AWS SDKs (Go V2, Python boto3, Java V2) may default to Flexible Checksums,
@@ -582,8 +718,12 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse the query string once and reuse. Calling r.URL.Query() multiple
+	// times reparses the RawQuery each invocation. Previously we paid for
+	// 5+ parses per request (lifecycle/cors/logging/website/tagging).
+	q := r.URL.Query()
 	hasQueryParam := func(key string) bool {
-		for k := range r.URL.Query() {
+		for k := range q {
 			if strings.EqualFold(k, key) {
 				return true
 			}
@@ -693,30 +833,12 @@ func (t *dryRunTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 func handlePutLifecycle(w http.ResponseWriter, r *http.Request) {
 	log := reqLogger(r.Context())
 
-	// 1. Read body (capped at 64 KB to match S3 control-plane limit)
-	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneBodySize)
-	defer r.Body.Close()
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if err.Error() == "http: request body too large" {
-			writeS3Error(w, http.StatusBadRequest, "MaxMessageLengthExceeded",
-				fmt.Sprintf("Your request was too big. Max configuration size is %d bytes.", maxControlPlaneBodySize))
-			return
-		}
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to read request body.")
-		return
-	}
-	log.Info("Read lifecycle request body", "body_size", len(body))
-
-	// 2. Parse S3 XML
 	var s3Cfg translate.LifecycleConfiguration
-	if err := xml.Unmarshal(body, &s3Cfg); err != nil {
-		log.Error("Failed to unmarshal S3 XML for Lifecycle", "error", err)
-		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.")
+	if !decodeControlPlaneXML(w, r, "lifecycle", &s3Cfg) {
 		return
 	}
 
-	// 3. Translate S3 XML directly to GCS SDK Lifecycle struct
+	// Translate S3 XML directly to GCS SDK Lifecycle struct.
 	storageLifecycle, err := translate.TranslateS3ToGCSLifecycle(&s3Cfg)
 	if err != nil {
 		log.Error("Failed to translate lifecycle to GCS SDK", "error", err)
@@ -799,30 +921,12 @@ func handleDeleteLifecycle(w http.ResponseWriter, r *http.Request) {
 func handlePutCORS(w http.ResponseWriter, r *http.Request) {
 	log := reqLogger(r.Context())
 
-	// 1. Read body (capped at 64 KB to match S3 control-plane limit)
-	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneBodySize)
-	defer r.Body.Close()
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if err.Error() == "http: request body too large" {
-			writeS3Error(w, http.StatusBadRequest, "MaxMessageLengthExceeded",
-				fmt.Sprintf("Your request was too big. Max configuration size is %d bytes.", maxControlPlaneBodySize))
-			return
-		}
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to read request body.")
-		return
-	}
-	log.Info("Read CORS request body", "body_size", len(body))
-
-	// 2. Parse S3 XML
 	var s3Cfg translate.CORSConfiguration
-	if err := xml.Unmarshal(body, &s3Cfg); err != nil {
-		log.Error("Failed to unmarshal S3 XML for CORS", "error", err)
-		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.")
+	if !decodeControlPlaneXML(w, r, "cors", &s3Cfg) {
 		return
 	}
 
-	// 3. Translate to GCS CORS
+	// Translate to GCS CORS.
 	gcsCORS, droppedHeaders := translate.TranslateS3ToGCSCors(&s3Cfg)
 
 	// Warn client about unsupported AllowedHeaders via response header
@@ -844,7 +948,7 @@ func handlePutCORS(w http.ResponseWriter, r *http.Request) {
 		CORS: gcsCORS,
 	}
 
-	err = timeGCSCall(r.Context(), "PutBucketCors", func(ctx context.Context) error {
+	err := timeGCSCall(r.Context(), "PutBucketCors", func(ctx context.Context) error {
 		_, e := bucket.Update(ctx, uattrs)
 		return e
 	})
@@ -906,25 +1010,8 @@ func handleDeleteCORS(w http.ResponseWriter, r *http.Request) {
 func handlePutLogging(w http.ResponseWriter, r *http.Request) {
 	log := reqLogger(r.Context())
 
-	// Read body (capped at 64 KB to match S3 control-plane limit)
-	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneBodySize)
-	defer r.Body.Close()
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if err.Error() == "http: request body too large" {
-			writeS3Error(w, http.StatusBadRequest, "MaxMessageLengthExceeded",
-				fmt.Sprintf("Your request was too big. Max configuration size is %d bytes.", maxControlPlaneBodySize))
-			return
-		}
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to read request body.")
-		return
-	}
-	log.Info("Read logging request body", "body_size", len(body))
-
 	var s3Cfg translate.BucketLoggingStatus
-	if err := xml.Unmarshal(body, &s3Cfg); err != nil {
-		log.Error("Failed to unmarshal S3 XML for Logging", "error", err)
-		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.")
+	if !decodeControlPlaneXML(w, r, "logging", &s3Cfg) {
 		return
 	}
 
@@ -941,7 +1028,7 @@ func handlePutLogging(w http.ResponseWriter, r *http.Request) {
 		Logging: gcsLogging,
 	}
 
-	err = timeGCSCall(r.Context(), "PutBucketLogging", func(ctx context.Context) error {
+	err := timeGCSCall(r.Context(), "PutBucketLogging", func(ctx context.Context) error {
 		_, e := bucket.Update(ctx, uattrs)
 		return e
 	})
@@ -999,25 +1086,8 @@ func handleDeleteLogging(w http.ResponseWriter, r *http.Request) {
 func handlePutWebsite(w http.ResponseWriter, r *http.Request) {
 	log := reqLogger(r.Context())
 
-	// Read body (capped at 64 KB to match S3 control-plane limit)
-	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneBodySize)
-	defer r.Body.Close()
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if err.Error() == "http: request body too large" {
-			writeS3Error(w, http.StatusBadRequest, "MaxMessageLengthExceeded",
-				fmt.Sprintf("Your request was too big. Max configuration size is %d bytes.", maxControlPlaneBodySize))
-			return
-		}
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to read request body.")
-		return
-	}
-	log.Info("Read website request body", "body_size", len(body))
-
 	var s3Cfg translate.WebsiteConfiguration
-	if err := xml.Unmarshal(body, &s3Cfg); err != nil {
-		log.Error("Failed to unmarshal S3 XML for Website", "error", err)
-		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.")
+	if !decodeControlPlaneXML(w, r, "website", &s3Cfg) {
 		return
 	}
 
@@ -1034,7 +1104,7 @@ func handlePutWebsite(w http.ResponseWriter, r *http.Request) {
 		Website: gcsWebsite,
 	}
 
-	err = timeGCSCall(r.Context(), "PutBucketWebsite", func(ctx context.Context) error {
+	err := timeGCSCall(r.Context(), "PutBucketWebsite", func(ctx context.Context) error {
 		_, e := bucket.Update(ctx, uattrs)
 		return e
 	})
@@ -1097,25 +1167,8 @@ func handleDeleteWebsite(w http.ResponseWriter, r *http.Request) {
 func handlePutObjectTagging(w http.ResponseWriter, r *http.Request) {
 	log := reqLogger(r.Context())
 
-	// Read body (capped at 64 KB to match S3 control-plane limit)
-	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneBodySize)
-	defer r.Body.Close()
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if err.Error() == "http: request body too large" {
-			writeS3Error(w, http.StatusBadRequest, "MaxMessageLengthExceeded",
-				fmt.Sprintf("Your request was too big. Max configuration size is %d bytes.", maxControlPlaneBodySize))
-			return
-		}
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to read request body.")
-		return
-	}
-	log.Info("Read tagging request body", "body_size", len(body))
-
 	var s3Cfg translate.Tagging
-	if err := xml.Unmarshal(body, &s3Cfg); err != nil {
-		log.Error("Failed to unmarshal S3 XML for Tagging", "error", err)
-		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.")
+	if !decodeControlPlaneXML(w, r, "tagging", &s3Cfg) {
 		return
 	}
 
@@ -1138,7 +1191,7 @@ func handlePutObjectTagging(w http.ResponseWriter, r *http.Request) {
 
 	obj := gcsClient.Bucket(targetBucket).Object(targetObject)
 	var attrs *storage.ObjectAttrs
-	err = timeGCSCall(r.Context(), "GetObjectAttrs_Tagging", func(ctx context.Context) error {
+	err := timeGCSCall(r.Context(), "GetObjectAttrs_Tagging", func(ctx context.Context) error {
 		var e error
 		attrs, e = obj.Attrs(ctx)
 		return e
@@ -1262,8 +1315,67 @@ func handleDeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// decodeControlPlaneXML reads and unmarshals a size-capped XML body into
+// `out`, which MUST be a non-nil pointer to a value compatible with
+// encoding/xml.Unmarshal. Returns true on success; otherwise it has
+// already written an S3-compatible error response to `w` and the caller
+// should return immediately.
+//
+// Centralises the boilerplate previously duplicated across
+// handlePutLifecycle / handlePutCORS / handlePutLogging / handlePutWebsite
+// / handlePutObjectTagging — with consistent request-size capping
+// (maxControlPlaneBodySize) and MaxBytesError detection via errors.As
+// instead of brittle string matching.
+func decodeControlPlaneXML(w http.ResponseWriter, r *http.Request, label string, out any) bool {
+	log := reqLogger(r.Context())
+	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneBodySize)
+	defer r.Body.Close()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeS3Error(w, http.StatusBadRequest, "MaxMessageLengthExceeded",
+				fmt.Sprintf("Your request was too big. Max configuration size is %d bytes.", maxControlPlaneBodySize))
+			return false
+		}
+		log.Error("Failed to read control-plane request body", "label", label, "error", err)
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to read request body.")
+		return false
+	}
+	log.Info("Read control-plane request body", "label", label, "body_size", len(body))
+
+	if err := xml.Unmarshal(body, out); err != nil {
+		log.Error("Failed to unmarshal S3 XML", "label", label, "error", err)
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML",
+			"The XML you provided was not well-formed or did not validate against our published schema.")
+		return false
+	}
+	return true
+}
+
+// s3ErrorBody is the on-the-wire shape of an AWS S3 error response. The XML
+// prolog is written separately so we preserve the canonical
+// `<?xml version="1.0" encoding="UTF-8"?>` header that S3 SDK parsers expect.
+type s3ErrorBody struct {
+	XMLName xml.Name `xml:"Error"`
+	Code    string   `xml:"Code"`
+	Message string   `xml:"Message"`
+}
+
+// writeS3Error emits a standard AWS S3-format XML error response.
+//
+// The payload is produced with encoding/xml so that special characters in
+// `message` (e.g. user-supplied filter names containing `<`, `&`, `"`) are
+// safely escaped. Prior to v1.4 this used fmt.Fprintf, which could emit
+// invalid XML when an error surfaced attacker-controlled strings.
 func writeS3Error(w http.ResponseWriter, statusCode int, code string, message string) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
-	fmt.Fprintf(w, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>%s</Code><Message>%s</Message></Error>\n", code, message)
+	fmt.Fprint(w, xml.Header)
+	enc := xml.NewEncoder(w)
+	if err := enc.Encode(s3ErrorBody{Code: code, Message: message}); err != nil {
+		slog.Error("Failed to encode S3 error body", "error", err)
+	}
+	_ = enc.Flush()
+	fmt.Fprintln(w)
 }

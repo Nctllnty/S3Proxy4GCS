@@ -92,22 +92,99 @@ var (
 		},
 		[]string{"operation"},
 	)
+
+	// GCSErrorsTotal counts GCS failures seen by the proxy, separately for
+	// data-plane (reverse proxy responses) and control-plane (SDK calls).
+	// status_class buckets: "4xx", "5xx", "429" (throttling), "network"
+	// (transport/timeout), "other" (e.g. context cancelled).
+	GCSErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_gcs_errors_total",
+			Help: "Total number of GCS responses/SDK calls classified as errors, by operation and status class.",
+		},
+		[]string{"operation", "status_class"},
+	)
+
+	// InFlightRequests tracks the number of requests currently being
+	// served by the proxy, broken down by endpoint. Useful for detecting
+	// long-running PUTs that saturate the concurrency throttle.
+	InFlightRequests = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "s3proxy_in_flight_requests",
+			Help: "Requests currently in flight in the proxy, by endpoint.",
+		},
+		[]string{"endpoint"},
+	)
+
+	// ResignDurationSeconds measures the SigV4 re-signing cost per request.
+	// Quantifies how much CPU is spent in the Director hot path relative to
+	// the full request duration.
+	ResignDurationSeconds = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name: "s3proxy_resign_duration_seconds",
+			Help: "Time spent inside SigV4 re-signing for each proxied request.",
+			// Very short durations: 10us, 50us, 100us, 500us, 1ms, 5ms, 10ms, 50ms.
+			Buckets: []float64{1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2},
+		},
+	)
 )
+
+// ClassifyGCSError maps an HTTP status code to a low-cardinality status_class
+// label used by GCSErrorsTotal. Returns "" when the code is not an error
+// (i.e. 2xx/3xx), so the caller can skip incrementing.
+func ClassifyGCSError(statusCode int) string {
+	switch {
+	case statusCode == 429:
+		return "429"
+	case statusCode >= 500 && statusCode < 600:
+		return "5xx"
+	case statusCode >= 400 && statusCode < 500:
+		return "4xx"
+	default:
+		return ""
+	}
+}
+
+// controlPlaneQueryKeys lists S3 subresource query parameters that route to
+// the in-proxy XML translators. Detected as separate endpoints so operators
+// can tell control-plane CPU cost apart from data-plane streaming.
+var controlPlaneQueryKeys = []string{"lifecycle", "cors", "logging", "website", "tagging"}
 
 // classifyEndpoint returns a simplified S3 operation label based on the HTTP
 // method and request URL. The mapping keeps cardinality low and avoids leaking
 // bucket/object names into label values.
+//
+// Prior to v1.3 all control-plane paths collapsed into "other"; they are now
+// reported individually (`lifecycle` / `cors` / `logging` / `website` /
+// `tagging`) so their latency and error rate can be tracked separately.
 func classifyEndpoint(method, rawPath string) string {
-	// Strip query string and leading slash.
+	// Split path and query once; we need both.
+	path := rawPath
+	query := ""
 	if i := strings.IndexByte(rawPath, '?'); i >= 0 {
-		rawPath = rawPath[:i]
+		path = rawPath[:i]
+		query = rawPath[i+1:]
 	}
-	trimmed := strings.Trim(rawPath, "/")
+	trimmed := strings.Trim(path, "/")
 
 	// Reserved operational endpoints never hit this middleware, but guard anyway.
 	switch trimmed {
 	case "health", "readyz", "metrics":
 		return "other"
+	}
+
+	// Control-plane subresources take precedence: a PUT /?lifecycle request
+	// is NOT put_object — it's an XML-translated bucket update.
+	if query != "" {
+		for _, key := range controlPlaneQueryKeys {
+			if hasQueryKey(query, key) {
+				return key
+			}
+		}
+		// Multi-object delete: POST /?delete
+		if hasQueryKey(query, "delete") && method == http.MethodPost {
+			return "delete_objects"
+		}
 	}
 
 	// Determine whether the path has a bucket and/or object key.
@@ -143,6 +220,30 @@ func classifyEndpoint(method, rawPath string) string {
 	default:
 		return "other"
 	}
+}
+
+// hasQueryKey does a zero-allocation scan over a raw URL query string and
+// reports whether `key` appears as a parameter name (the segment preceding
+// `=` or the whole segment if no `=`). Avoids url.ParseQuery's allocations
+// on a hot path that runs once per request.
+func hasQueryKey(rawQuery, key string) bool {
+	for len(rawQuery) > 0 {
+		seg := rawQuery
+		if i := strings.IndexByte(seg, '&'); i >= 0 {
+			seg = rawQuery[:i]
+			rawQuery = rawQuery[i+1:]
+		} else {
+			rawQuery = ""
+		}
+		name := seg
+		if i := strings.IndexByte(seg, '='); i >= 0 {
+			name = seg[:i]
+		}
+		if name == key {
+			return true
+		}
+	}
+	return false
 }
 
 // countingReadCloser wraps an io.ReadCloser and counts bytes read from it.
@@ -229,24 +330,57 @@ func WithMetrics(next http.Handler) http.Handler {
 
 		rec := &countingResponseWriter{ResponseWriter: w, status: http.StatusOK}
 
+		inFlight := InFlightRequests.WithLabelValues(endpoint)
+		inFlight.Inc()
+
 		start := time.Now()
+
+		// All observations are deferred so they execute even if the
+		// downstream handler panics (chi's Recoverer lives further up the
+		// stack and turns the panic into a 500). Without this, a crash
+		// would leave `s3proxy_in_flight_requests` leaked and the request
+		// count uncounted.
+		defer func() {
+			duration := time.Since(start)
+			inFlight.Dec()
+
+			var reqBytes int64
+			if reqCounter != nil {
+				reqBytes = reqCounter.count
+			}
+			respBytes := rec.bytes
+
+			BytesReceivedTotal.WithLabelValues(r.Method, endpoint).Add(float64(reqBytes))
+			BytesSentTotal.WithLabelValues(r.Method, endpoint).Add(float64(respBytes))
+			RequestSizeBytes.WithLabelValues(r.Method, endpoint).Observe(float64(reqBytes))
+			ResponseSizeBytes.WithLabelValues(r.Method, endpoint).Observe(float64(respBytes))
+
+			// If the panic reached Recoverer before any WriteHeader, rec.status
+			// still holds its default (200). Coerce to 500 in that case so the
+			// status_code label reflects what the client actually receives.
+			status := rec.status
+			if pv := recover(); pv != nil {
+				if !rec.wroteHeader {
+					status = http.StatusInternalServerError
+				}
+				defer panic(pv) // propagate to chi's Recoverer
+			}
+
+			statusStr := strconv.Itoa(status)
+			HTTPRequestsTotal.WithLabelValues(r.Method, endpoint, statusStr).Inc()
+			HTTPRequestDurationSeconds.WithLabelValues(r.Method, endpoint).Observe(duration.Seconds())
+
+			// Error-class counter: records every non-2xx/3xx response the proxy
+			// returned to clients. The label is the classified endpoint (so you
+			// can tell `get_object 5xx` from `lifecycle 5xx`) rather than the
+			// raw GCS SDK operation name (that variant is handled in
+			// timeGCSCall).
+			if class := ClassifyGCSError(status); class != "" {
+				GCSErrorsTotal.WithLabelValues(endpoint, class).Inc()
+			}
+		}()
+
 		next.ServeHTTP(rec, r)
-		duration := time.Since(start)
-
-		var reqBytes int64
-		if reqCounter != nil {
-			reqBytes = reqCounter.count
-		}
-		respBytes := rec.bytes
-
-		BytesReceivedTotal.WithLabelValues(r.Method, endpoint).Add(float64(reqBytes))
-		BytesSentTotal.WithLabelValues(r.Method, endpoint).Add(float64(respBytes))
-		RequestSizeBytes.WithLabelValues(r.Method, endpoint).Observe(float64(reqBytes))
-		ResponseSizeBytes.WithLabelValues(r.Method, endpoint).Observe(float64(respBytes))
-
-		statusStr := strconv.Itoa(rec.status)
-		HTTPRequestsTotal.WithLabelValues(r.Method, endpoint, statusStr).Inc()
-		HTTPRequestDurationSeconds.WithLabelValues(r.Method, endpoint).Observe(duration.Seconds())
 	})
 }
 
