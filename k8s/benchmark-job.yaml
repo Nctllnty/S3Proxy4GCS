@@ -37,9 +37,9 @@ spec:
             - "-test.timeout=20m"
             - "-test.run=TestBenchmarkSuite"
           env:
-            # Reach S3Proxy through ClusterIP Service (lowest latency, no LB overhead)
+            # Reach S3Proxy through ClusterIP Service (port 80 -> targetPort 8080)
             - name: PROXY_ENDPOINT
-              value: "http://s3proxy:8080"
+              value: "http://s3proxy"
             - name: GCS_HMAC_ACCESS
               valueFrom:
                 secretKeyRef:

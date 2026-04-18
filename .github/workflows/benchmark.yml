@@ -90,7 +90,7 @@ jobs:
           kubectl run health-check --rm -i --restart=Never \
             -n ${{ env.K8S_NAMESPACE }} \
             --image=curlimages/curl:latest \
-            -- curl -sf --max-time 10 http://s3proxy:8080/health
+            -- curl -sf --max-time 10 http://s3proxy/health
           echo "S3Proxy is healthy via ClusterIP"
 
       # ---- Run Benchmark as K8s Job ----
