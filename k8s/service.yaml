@@ -6,14 +6,16 @@ metadata:
   labels:
     app: s3proxy
   annotations:
-    cloud.google.com/backend-config: '{"default":"s3proxy-backendconfig"}'
-    cloud.google.com/neg: '{"ingress": true}'
+    # L4 Internal Load Balancer (TCP passthrough) — lowest latency,
+    # no HTTP parsing overhead.  Exposes a stable VPC-internal VIP
+    # that SDK clusters can reach via Cloud DNS private zone.
+    networking.gke.io/load-balancer-type: "Internal"
 spec:
-  type: ClusterIP
+  type: LoadBalancer
   selector:
     app: s3proxy
   ports:
     - name: http
-      port: 8080
+      port: 80
       targetPort: 8080
       protocol: TCP

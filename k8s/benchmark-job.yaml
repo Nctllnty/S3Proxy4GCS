@@ -1,4 +1,4 @@
-# Benchmark Job: runs inside the cluster, reaches S3Proxy through internal ALB / ingress DNS.
+# Benchmark Job: runs inside the cluster, reaches S3Proxy through ClusterIP Service (direct).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -15,9 +15,9 @@ spec:
         app: benchmark
     spec:
       serviceAccountName: s3proxy
-      # Benchmark pod must run only on benchmark-only node pool.
+      # Prefer benchmark on c4d-pool for consistent hardware baseline.
       nodeSelector:
-        cloud.google.com/gke-nodepool: benchmark-c4-pool-new
+        cloud.google.com/gke-nodepool: c4d-pool
       # Ensure benchmark and s3proxy pods land on different nodes
       affinity:
         podAntiAffinity:
@@ -37,9 +37,9 @@ spec:
             - "-test.timeout=20m"
             - "-test.run=TestBenchmarkSuite"
           env:
-            # Reach S3Proxy through internal ingress / ALB DNS
+            # Reach S3Proxy through ClusterIP Service (lowest latency, no LB overhead)
             - name: PROXY_ENDPOINT
-              value: "http://s3proxy.lb.local"
+              value: "http://s3proxy:8080"
             - name: GCS_HMAC_ACCESS
               valueFrom:
                 secretKeyRef:

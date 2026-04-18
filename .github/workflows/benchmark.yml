@@ -78,42 +78,23 @@ jobs:
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
-          kubectl apply -f k8s/backendconfig.yaml
-          kubectl apply -f k8s/ingress.yaml
+          kubectl apply -f k8s/hpa.yaml 2>/dev/null || true
           kubectl set image deployment/s3proxy s3proxy="$IMAGE" -n ${{ env.K8S_NAMESPACE }}
           kubectl rollout status deployment/s3proxy -n ${{ env.K8S_NAMESPACE }} --timeout=120s
 
-      # ---- Internal Ingress Health Check ----
-      - name: Verify S3Proxy Health (Internal Ingress)
+      # ---- ClusterIP Health Check ----
+      - name: Verify S3Proxy Health (ClusterIP)
         run: |
-          kubectl apply -f k8s/benchmark-job.yaml | head -1
-
-          # Wait a moment for ingress programming / DNS propagation inside VPC
-          sleep 10
+          kubectl rollout status deployment/s3proxy -n ${{ env.K8S_NAMESPACE }} --timeout=120s
 
           kubectl run health-check --rm -i --restart=Never \
             -n ${{ env.K8S_NAMESPACE }} \
             --image=curlimages/curl:latest \
-            -- curl -sf --max-time 10 http://s3proxy.lb.local/health
-          echo "S3Proxy is healthy via internal ingress DNS"
-
-      # ---- Network Path Verification ----
-      - name: Verify Network Path (Internal ALB / Ingress)
-        run: |
-          kubectl run dns-check --rm -i --restart=Never \
-            -n ${{ env.K8S_NAMESPACE }} \
-            --image=busybox:1.36 \
-            -- nslookup s3proxy.lb.local
-          echo "Internal DNS verified: s3proxy.lb.local resolves inside VPC"
-
-          # Show cluster networking mode
-          echo "--- GKE Networking Info ---"
-          kubectl get nodes -o jsonpath='{.items[0].metadata.labels}' | \
-            python3 -c "import json,sys; d=json.load(sys.stdin); print('Dataplane:', d.get('cloud.google.com/gke-netd-ready','N/A'))"
-          echo "GKE Dataplane V2 (eBPF): bypasses iptables and kube-proxy entirely"
+            -- curl -sf --max-time 10 http://s3proxy:8080/health
+          echo "S3Proxy is healthy via ClusterIP"
 
       # ---- Run Benchmark as K8s Job ----
-      - name: Run Benchmark Job (via Internal ALB / Ingress)
+      - name: Run Benchmark Job (ClusterIP direct)
         run: |
           BENCH_IMAGE="${{ env.GAR_REGISTRY }}/s3proxy-benchmark:${{ steps.meta.outputs.tag }}"
 
@@ -204,7 +185,7 @@ jobs:
         run: |
           echo "# Performance Benchmark Report (In-Cluster)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Network Path:** Benchmark Pod -> internal ALB / ingress -> ClusterIP service -> S3Proxy Pod" >> $GITHUB_STEP_SUMMARY
+          echo "**Network Path:** Benchmark Pod -> ClusterIP Service -> S3Proxy Pod" >> $GITHUB_STEP_SUMMARY
           echo "**Dataplane:** GKE Dataplane V2 (eBPF/Cilium)" >> $GITHUB_STEP_SUMMARY
           echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Concurrency:** ${{ inputs.concurrency }} | **Duration:** ${{ inputs.duration_sec }}s per test" >> $GITHUB_STEP_SUMMARY
@@ -234,4 +215,4 @@ jobs:
         if: always()
         run: |
           kubectl delete job benchmark -n ${{ env.K8S_NAMESPACE }} --ignore-not-found
-          kubectl delete pod health-check dns-check -n ${{ env.K8S_NAMESPACE }} --ignore-not-found 2>/dev/null || true
+          kubectl delete pod health-check -n ${{ env.K8S_NAMESPACE }} --ignore-not-found 2>/dev/null || true

@@ -35,13 +35,16 @@ spec:
                     values:
                       - c3d-pool
                       - c4d-pool
-        # Ensure s3proxy and benchmark pods land on different nodes
+        # Prefer s3proxy and benchmark pods on different nodes, but allow
+        # co-location when node capacity is limited (e.g. single-node pools).
         podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app: benchmark
-              topologyKey: kubernetes.io/hostname
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: benchmark
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: s3proxy
           # Image tag is updated by CI via: kubectl set image deployment/s3proxy s3proxy=IMAGE
