@@ -66,8 +66,7 @@ jobs:
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
-          kubectl apply -f k8s/backendconfig.yaml
-          kubectl apply -f k8s/ingress.yaml
+          kubectl apply -f k8s/hpa.yaml 2>/dev/null || true
           kubectl set image deployment/s3proxy s3proxy="$IMAGE" -n ${{ env.K8S_NAMESPACE }}
           kubectl rollout status deployment/s3proxy -n ${{ env.K8S_NAMESPACE }} --timeout=120s
 
@@ -75,7 +74,7 @@ jobs:
         id: endpoint
         run: |
           echo "127.0.0.1 s3proxy.lb.local" | sudo tee -a /etc/hosts
-          kubectl port-forward svc/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
+          kubectl port-forward deployment/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
           sleep 5
 
           for i in $(seq 1 30); do
@@ -121,7 +120,7 @@ jobs:
           gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
             --region ${{ env.GKE_REGION }} --project cbs-poctest
           echo "127.0.0.1 s3proxy.lb.local" | sudo tee -a /etc/hosts
-          kubectl port-forward svc/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
+          kubectl port-forward deployment/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -sf http://s3proxy.lb.local:8080/readyz > /dev/null 2>&1; then
               echo "Proxy is ready!"
@@ -179,7 +178,7 @@ jobs:
           gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
             --region ${{ env.GKE_REGION }} --project cbs-poctest
           echo "127.0.0.1 s3proxy.lb.local" | sudo tee -a /etc/hosts
-          kubectl port-forward svc/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
+          kubectl port-forward deployment/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -sf http://s3proxy.lb.local:8080/readyz > /dev/null 2>&1; then
               echo "Proxy is ready!"
@@ -236,7 +235,7 @@ jobs:
           gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
             --region ${{ env.GKE_REGION }} --project cbs-poctest
           echo "127.0.0.1 s3proxy.lb.local" | sudo tee -a /etc/hosts
-          kubectl port-forward svc/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
+          kubectl port-forward deployment/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -sf http://s3proxy.lb.local:8080/readyz > /dev/null 2>&1; then
               echo "Proxy is ready!"
@@ -302,7 +301,7 @@ jobs:
           gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
             --region ${{ env.GKE_REGION }} --project cbs-poctest
           echo "127.0.0.1 s3proxy.lb.local" | sudo tee -a /etc/hosts
-          kubectl port-forward svc/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
+          kubectl port-forward deployment/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -sf http://s3proxy.lb.local:8080/readyz > /dev/null 2>&1; then
               echo "Proxy is ready!"
@@ -363,7 +362,7 @@ jobs:
           gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
             --region ${{ env.GKE_REGION }} --project cbs-poctest
           echo "127.0.0.1 s3proxy.lb.local" | sudo tee -a /etc/hosts
-          kubectl port-forward svc/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
+          kubectl port-forward deployment/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -sf http://s3proxy.lb.local:8080/readyz > /dev/null 2>&1; then
               echo "Proxy is ready!"
@@ -448,7 +447,7 @@ jobs:
         run: |
           set -o pipefail
           echo "127.0.0.1 s3proxy.lb.local" | sudo tee -a /etc/hosts
-          kubectl port-forward svc/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
+          kubectl port-forward deployment/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -sf http://s3proxy.lb.local:8080/readyz > /dev/null 2>&1; then
               echo "Proxy is ready!"
