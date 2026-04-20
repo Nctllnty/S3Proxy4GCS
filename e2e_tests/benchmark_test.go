@@ -118,6 +118,35 @@ type loadResult struct {
 	errors    int64
 }
 
+// cleanupPutKeys deletes the given keys in parallel (best-effort, no error
+// propagation).  This runs AFTER the benchmark measurement is complete so
+// the DELETE traffic does not interfere with PutObject throughput numbers.
+func cleanupPutKeys(client *s3.Client, bucket string, keys []string, workers int) {
+	if len(keys) == 0 {
+		return
+	}
+	ch := make(chan string, len(keys))
+	for _, k := range keys {
+		ch <- k
+	}
+	close(ch)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for key := range ch {
+				client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(key),
+				})
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // runConcurrentLoad runs fn across N goroutines for the specified duration,
 // collecting per-operation latencies from all goroutines.
 func runConcurrentLoad(concurrency int, duration time.Duration, fn func() error) loadResult {
@@ -283,6 +312,12 @@ func TestBenchmarkSuite(t *testing.T) {
 		t.Logf("=== PutObject %s (%d concurrent, %ds) ===", tier.Name, concurrency, durationSec)
 		payload := makePayload(tier.Size)
 
+		// Collect keys for post-benchmark cleanup instead of fire-and-forget
+		// DELETEs that would share the writeProxy HTTP/2 connection and
+		// interfere with PUT throughput measurement.
+		var putKeysMu sync.Mutex
+		var putKeys []string
+
 		before, _ := mc.Snapshot()
 		start := time.Now()
 
@@ -293,14 +328,10 @@ func TestBenchmarkSuite(t *testing.T) {
 				Key:    aws.String(key),
 				Body:   strings.NewReader(payload),
 			})
-			// Best-effort cleanup (fire and forget)
 			if err == nil {
-				go func() {
-					client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
-						Bucket: aws.String(bucket),
-						Key:    aws.String(key),
-					})
-				}()
+				putKeysMu.Lock()
+				putKeys = append(putKeys, key)
+				putKeysMu.Unlock()
 			}
 			return err
 		})
@@ -315,6 +346,11 @@ func TestBenchmarkSuite(t *testing.T) {
 		report.Results = append(report.Results, result)
 
 		printBenchResult(t, result)
+
+		// Deferred batch cleanup — runs AFTER measurement is complete.
+		t.Logf("  Cleaning up %d objects...", len(putKeys))
+		cleanupPutKeys(client, bucket, putKeys, concurrency)
+		t.Logf("  Cleanup done.")
 	}
 
 	// =======================================================================
