@@ -346,7 +346,7 @@ func TestRestoreObject(t *testing.T) {
 
 	// Put object with GLACIER storage class
 	_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket:       aws.String(bucket), Key: aws.String(key),
+		Bucket: aws.String(bucket), Key: aws.String(key),
 		Body:         strings.NewReader("restore test content"),
 		StorageClass: types.StorageClassGlacier,
 	})

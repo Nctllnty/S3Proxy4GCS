@@ -323,7 +323,7 @@ func TestRestoreObject(t *testing.T) {
 	t.Cleanup(func() { Cleanup(t, client, bucket, key) })
 
 	_, err := client.PutObject(&s3.PutObjectInput{
-		Bucket:       aws.String(bucket), Key: aws.String(key),
+		Bucket: aws.String(bucket), Key: aws.String(key),
 		Body:         strings.NewReader("restore test content"),
 		StorageClass: aws.String("GLACIER"),
 	})
