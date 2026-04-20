@@ -15,9 +15,10 @@ spec:
         app: benchmark
     spec:
       serviceAccountName: s3proxy
-      # Prefer benchmark on c4d-pool for consistent hardware baseline.
+      # Fixed benchmark client pool: dedicated c4-highcpu-8 hardware ensures
+      # fair A/B comparison regardless of which proxy pool is under test.
       nodeSelector:
-        cloud.google.com/gke-nodepool: c4d-pool
+        cloud.google.com/gke-nodepool: benchmark-c4-pool-new
       # Ensure benchmark and s3proxy pods land on different nodes
       affinity:
         podAntiAffinity:

@@ -137,20 +137,18 @@ jobs:
           kubectl delete job benchmark -n ${{ env.K8S_NAMESPACE }} --ignore-not-found
           sleep 2
 
-          # Determine benchmark node pool (opposite of proxy pool)
+          # Fixed benchmark client pool for fair A/B comparison.
+          # Using a dedicated pool ensures identical client hardware
+          # regardless of which proxy pool is under test.
           PROXY_POOL="${{ inputs.proxy_node_pool }}"
-          if [ "$PROXY_POOL" = "c3d-pool" ]; then
-            BENCH_POOL="c4d-pool"
-          else
-            BENCH_POOL="c3d-pool"
-          fi
-          echo "S3Proxy -> $PROXY_POOL | Benchmark -> $BENCH_POOL"
+          BENCH_POOL="benchmark-c4-pool-new"
+          echo "S3Proxy -> $PROXY_POOL | Benchmark -> $BENCH_POOL (fixed)"
 
           # Generate the job manifest with correct image, node pool, and parameters
           sed -e "s|image: .*s3proxy-benchmark:.*|image: ${BENCH_IMAGE}|" \
               -e "s|value: \"50\"|value: \"${{ inputs.concurrency }}\"|" \
               -e 's|value: "bench-incluster/"|value: "bench-${{ github.run_id }}/"|' \
-              -e "s|cloud.google.com/gke-nodepool: c4d-pool|cloud.google.com/gke-nodepool: ${BENCH_POOL}|" \
+              -e "s|cloud.google.com/gke-nodepool: benchmark-c4-pool-new|cloud.google.com/gke-nodepool: ${BENCH_POOL}|" \
               -e "s|value: \"c3d-pool\"|value: \"${PROXY_POOL}\"|" \
               k8s/benchmark-job.yaml | \
             sed "/BENCH_DURATION_SEC/{n;s|value: \"30\"|value: \"${{ inputs.duration_sec }}\"|;}" | \
