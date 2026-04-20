@@ -28,6 +28,12 @@ env:
   GAR_REGISTRY: us-east1-docker.pkg.dev/cbs-poctest/s3proxy
   K8S_NAMESPACE: s3proxy-e2e
 
+# Only one benchmark at a time — parallel runs share the same K8s
+# deployment/service/job and would corrupt each other's results.
+concurrency:
+  group: benchmark-exclusive
+  cancel-in-progress: false
+
 jobs:
   benchmark:
     name: Build, Deploy & In-Cluster Benchmark
