@@ -29,7 +29,7 @@ func getBenchConcurrency() int {
 			return n
 		}
 	}
-	return 20
+	return 50
 }
 
 func getBenchDurationSec() int {
@@ -49,6 +49,7 @@ func getBenchDurationSec() int {
 type BenchmarkReport struct {
 	Timestamp     string            `json:"timestamp"`
 	ProxyEndpoint string            `json:"proxy_endpoint"`
+	ProxyNodePool string            `json:"proxy_node_pool,omitempty"`
 	Config        BenchmarkConfig   `json:"config"`
 	Results       []BenchmarkResult `json:"results"`
 }
@@ -265,6 +266,7 @@ func TestBenchmarkSuite(t *testing.T) {
 	report := BenchmarkReport{
 		Timestamp:     time.Now().UTC().Format(time.RFC3339),
 		ProxyEndpoint: testEnv.ProxyEndpoint,
+		ProxyNodePool: os.Getenv("PROXY_NODE_POOL"),
 		Config: BenchmarkConfig{
 			Concurrency: concurrency,
 			DurationSec: durationSec,

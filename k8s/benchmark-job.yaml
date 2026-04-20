@@ -58,9 +58,11 @@ spec:
             - name: TEST_PREFIX
               value: "bench-incluster/"
             - name: BENCH_CONCURRENCY
-              value: "20"
+              value: "50"
             - name: BENCH_DURATION_SEC
               value: "30"
+            - name: PROXY_NODE_POOL
+              value: "c3d-pool"
             - name: PROMETHEUS_URL
               # Actual service name in this cluster is `monitoring-prometheus`
               # (not the upstream default `monitoring-kube-prometheus-prometheus`).

@@ -3,10 +3,18 @@ name: Performance Benchmark (In-Cluster)
 on:
   workflow_dispatch:
     inputs:
+      proxy_node_pool:
+        description: 'Node pool for S3Proxy (c3d-pool or c4d-pool)'
+        required: false
+        default: 'c3d-pool'
+        type: choice
+        options:
+          - c3d-pool
+          - c4d-pool
       concurrency:
         description: 'Number of concurrent goroutines'
         required: false
-        default: '20'
+        default: '50'
         type: string
       duration_sec:
         description: 'Duration per benchmark in seconds'
@@ -67,6 +75,7 @@ jobs:
 
       - name: Deploy S3Proxy
         run: |
+          PROXY_POOL="${{ inputs.proxy_node_pool }}"
           IMAGE="${{ env.GAR_REGISTRY }}/s3proxy:${{ steps.meta.outputs.tag }}"
           kubectl apply -f k8s/namespace.yaml
           kubectl create secret generic s3proxy-credentials \
@@ -76,7 +85,12 @@ jobs:
           kubectl create secret generic s3proxy-config \
             --from-literal=TARGET_BUCKET=${{ secrets.TEST_BUCKET }} \
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-          kubectl apply -f k8s/deployment.yaml
+
+          # Pin S3Proxy to the selected node pool (single-value nodeAffinity)
+          sed 's/- c3d-pool/- '"$PROXY_POOL"'/' k8s/deployment.yaml | \
+            sed '/- c4d-pool/d' | \
+            kubectl apply -f -
+
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/hpa.yaml 2>/dev/null || true
           kubectl set image deployment/s3proxy s3proxy="$IMAGE" -n ${{ env.K8S_NAMESPACE }}
@@ -102,10 +116,21 @@ jobs:
           kubectl delete job benchmark -n ${{ env.K8S_NAMESPACE }} --ignore-not-found
           sleep 2
 
-          # Generate the job manifest with correct image and parameters
+          # Determine benchmark node pool (opposite of proxy pool)
+          PROXY_POOL="${{ inputs.proxy_node_pool }}"
+          if [ "$PROXY_POOL" = "c3d-pool" ]; then
+            BENCH_POOL="c4d-pool"
+          else
+            BENCH_POOL="c3d-pool"
+          fi
+          echo "S3Proxy -> $PROXY_POOL | Benchmark -> $BENCH_POOL"
+
+          # Generate the job manifest with correct image, node pool, and parameters
           sed -e "s|image: .*s3proxy-benchmark:.*|image: ${BENCH_IMAGE}|" \
-              -e "s|value: \"20\"|value: \"${{ inputs.concurrency }}\"|" \
+              -e "s|value: \"50\"|value: \"${{ inputs.concurrency }}\"|" \
               -e 's|value: "bench-incluster/"|value: "bench-${{ github.run_id }}/"|' \
+              -e "s|cloud.google.com/gke-nodepool: c4d-pool|cloud.google.com/gke-nodepool: ${BENCH_POOL}|" \
+              -e "s|value: \"c3d-pool\"|value: \"${PROXY_POOL}\"|" \
               k8s/benchmark-job.yaml | \
             sed "/BENCH_DURATION_SEC/{n;s|value: \"30\"|value: \"${{ inputs.duration_sec }}\"|;}" | \
             kubectl apply -f -
@@ -188,6 +213,7 @@ jobs:
           echo "**Network Path:** Benchmark Pod -> ClusterIP Service -> S3Proxy Pod" >> $GITHUB_STEP_SUMMARY
           echo "**Dataplane:** GKE Dataplane V2 (eBPF/Cilium)" >> $GITHUB_STEP_SUMMARY
           echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**S3Proxy Node Pool:** \`${{ inputs.proxy_node_pool }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Concurrency:** ${{ inputs.concurrency }} | **Duration:** ${{ inputs.duration_sec }}s per test" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
