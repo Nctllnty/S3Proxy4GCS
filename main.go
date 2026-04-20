@@ -574,6 +574,11 @@ func observabilityMiddleware(next http.Handler) http.Handler {
 				break
 			}
 		}
+		if handlerLabel == "proxy" {
+			if _, ok := q["restore"]; ok && r.Method == http.MethodPost {
+				handlerLabel = "restore"
+			}
+		}
 
 		slog.Info("HTTP request completed",
 			"request_id", reqID,
@@ -799,6 +804,22 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 			handleDeleteObjectTagging(w, r)
 			return
 		}
+	}
+
+	// Check if this is a RestoreObject request. GCS objects in every storage
+	// class are always directly readable, so there is no real "thaw" step to
+	// perform; we synthesise an S3-compatible success response so legacy
+	// clients that still call RestoreObject keep working without changes.
+	if hasQueryParam("restore") {
+		if r.Method == http.MethodPost {
+			handleRestoreObject(w, r)
+			return
+		}
+		// Non-POST verbs on ?restore are not defined by S3; refuse instead of
+		// silently falling through to the data-plane proxy (AGENTS rule 4).
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented",
+			"Only POST /<bucket>/<key>?restore is supported for the RestoreObject operation.")
+		return
 	}
 
 	// Default: Fallthrough to Reverse Proxy
@@ -1313,6 +1334,93 @@ func handleDeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
 
 	log.Info("Successfully deleted GCS Object Tagging", "bucket", targetBucket, "object", targetObject)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRestoreObject synthesises an S3-compatible response for
+// `POST /<bucket>/<key>?restore`. GCS has no concept of "frozen" objects —
+// every storage class (STANDARD / NEARLINE / COLDLINE / ARCHIVE) is
+// immediately readable — so we return 200 OK as if the object were already
+// restored rather than forwarding to GCS (which would reply 400
+// InvalidArgument).
+//
+// Behaviour:
+//   - Consume at most maxControlPlaneBodySize of the request body and discard
+//     it. AWS callers may send a <RestoreRequest> XML document we do not
+//     need to parse; reading it ensures HTTP/1.1 keep-alive and SigV4
+//     Content-Length accounting stay healthy.
+//   - By default issue a HEAD probe so missing keys surface 404 NoSuchKey,
+//     matching AWS semantics. Operators can disable the probe via
+//     RESTORE_SKIP_EXISTENCE_CHECK=true when they want zero extra GCS calls.
+//   - Respond with an empty body and Content-Length: 0. A Date response
+//     header is added for log correlation.
+func handleRestoreObject(w http.ResponseWriter, r *http.Request) {
+	log := reqLogger(r.Context())
+
+	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(pathParts) < 2 || pathParts[0] == "" || pathParts[1] == "" {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument",
+			"Bucket and Object name required for RestoreObject.")
+		return
+	}
+	targetBucket := pathParts[0]
+	targetObject := strings.Join(pathParts[1:], "/")
+
+	// Drain the body with the same cap as other control-plane endpoints so
+	// an oversized <RestoreRequest> cannot exhaust memory. We never parse
+	// the XML; <Days>, GlacierJobParameters, Tier are not meaningful on GCS.
+	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneBodySize)
+	defer r.Body.Close()
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeS3Error(w, http.StatusBadRequest, "MaxMessageLengthExceeded",
+				fmt.Sprintf("Your request was too big. Max RestoreObject body size is %d bytes.", maxControlPlaneBodySize))
+			return
+		}
+		log.Warn("Failed to drain RestoreObject body", "error", err)
+	}
+
+	// Existence probe: run unless DryRun skips GCS entirely or the operator
+	// opted out. Keeping this behind an env flag lets latency-sensitive
+	// callers trade strict NoSuchKey behaviour for a zero-GCS fast path.
+	if !config.Config.DryRun && !config.Config.RestoreSkipExistenceCheck {
+		if gcsClient == nil {
+			// Should not happen outside DryRun (startup would have failed),
+			// but guard anyway so the shim never panics.
+			log.Error("RestoreObject invoked without a GCS client", "bucket", targetBucket, "object", targetObject)
+			writeS3Error(w, http.StatusInternalServerError, "InternalError",
+				"Proxy misconfiguration: GCS client unavailable.")
+			return
+		}
+		obj := gcsClient.Bucket(targetBucket).Object(targetObject)
+		err := timeGCSCall(r.Context(), "RestoreObject_HeadProbe", func(ctx context.Context) error {
+			_, e := obj.Attrs(ctx)
+			return e
+		})
+		if err != nil {
+			if errors.Is(err, storage.ErrObjectNotExist) {
+				writeS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
+				return
+			}
+			log.Error("GCS API call failed for RestoreObject_HeadProbe", "error", err)
+			writeS3Error(w, http.StatusBadGateway, "InternalError",
+				"Failed to verify object existence prior to synthesising RestoreObject response.")
+			return
+		}
+	}
+
+	w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	w.Header().Set("Content-Length", "0")
+	// Status 200 (not 202) because on GCS the object is already "restored" —
+	// callers can GET it immediately without polling.
+	w.WriteHeader(http.StatusOK)
+
+	log.Info("Synthesised RestoreObject response",
+		"bucket", targetBucket,
+		"object", targetObject,
+		"skip_existence_check", config.Config.RestoreSkipExistenceCheck,
+		"dry_run", config.Config.DryRun,
+	)
 }
 
 // decodeControlPlaneXML reads and unmarshals a size-capped XML body into

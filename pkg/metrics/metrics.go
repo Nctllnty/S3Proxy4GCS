@@ -185,6 +185,13 @@ func classifyEndpoint(method, rawPath string) string {
 		if hasQueryKey(query, "delete") && method == http.MethodPost {
 			return "delete_objects"
 		}
+		// RestoreObject: POST /<bucket>/<key>?restore — handled in-proxy
+		// as a synthetic 200/202 since GCS objects are always "live". Kept
+		// as its own label so operators can quickly spot callers that still
+		// depend on the compatibility shim.
+		if hasQueryKey(query, "restore") && method == http.MethodPost {
+			return "restore_object"
+		}
 	}
 
 	// Determine whether the path has a bucket and/or object key.

@@ -74,4 +74,4 @@ These features are known failures or formally deferred due to performance or arc
 -   **`UploadPartCopy`** cross-object multipart copies (GCS S3 API limitation).
 
 ### 13. Restore Object
--   **`RestoreObject`** (GCS considers archive objects "live", no restore required).
+-   **`RestoreObject`** — synthetic response implemented in proxy (v1.5+). GCS considers archive objects "live" so a real thaw is unnecessary; the proxy returns `200 OK` for live keys, `404 NoSuchKey` for missing keys, and `501 NotImplemented` for non-POST verbs on `?restore`. Regression covered by `integration_tests/restore_object_test.go` and `main_test.go`.

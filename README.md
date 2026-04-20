@@ -34,6 +34,7 @@ Available Configuration Options:
 -   `READ_BUFFER_SIZE` (Default: `65536`): TCP read buffer size (bytes) for the GET/HEAD read-path Transport. Larger values improve download throughput for large objects.
 -   `WRITE_BUFFER_SIZE` (Default: `65536`): TCP write buffer size (bytes) for the PUT/POST/DELETE write-path Transport. Larger values improve upload throughput for large objects.
 -   `PPROF_ADDR` (Default: empty / disabled): Bind address for the optional `net/http/pprof` profiling endpoint (e.g. `127.0.0.1:6060`). Uses a dedicated listener so runtime profiles never compete with or leak through the main data-plane port. Enable only for diagnostics.
+-   `RESTORE_SKIP_EXISTENCE_CHECK` (Default: `false`): Controls the GCS HEAD probe in the synthetic `RestoreObject` shim (see [Compatibility Shims](#compatibility-shims)). Leave at `false` so missing keys return `404 NoSuchKey`; set to `true` to save one Class B GCS call per `RestoreObject` when callers can tolerate deferred 404 discovery on the next `GetObject`.
 
 ## Alternative: Transparent Routing via HTTP_PROXY
 
@@ -130,12 +131,22 @@ graph TB
 - **Lifecycle Intercept**: Translates S3 XML Lifecycle Configuration to GCS JSON.
 - **Real GCS Forwarding**: Submits translated JSON to GCS via official GCS Go SDK.
 - **Structured JSON Logging**: Native `log/slog` for modern cloud observability (Parsable JSON lines). Production default `DEBUG_LOGGING=false` emits exactly 2 log lines per data-plane request (`Received S3 Request` + `HTTP request completed`); `DEBUG_LOGGING=true` enables full header / signing traces for diagnostics only. Chi's plain-text access log middleware is intentionally disabled to avoid duplicate records.
-- **Prometheus Metrics**: Request counts, latency histograms, GCS API call duration at `/metrics`. Control-plane operations (`lifecycle` / `cors` / `logging` / `website` / `tagging`) and `delete_objects` are reported as dedicated endpoint labels. Additional v1.3 series: `s3proxy_in_flight_requests`, `s3proxy_resign_duration_seconds`, `s3proxy_gcs_errors_total{status_class}`. See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) and [`docs/SLO.md`](docs/SLO.md).
+- **Prometheus Metrics**: Request counts, latency histograms, GCS API call duration at `/metrics`. Control-plane operations (`lifecycle` / `cors` / `logging` / `website` / `tagging`), `delete_objects`, and `restore_object` (v1.5+) are reported as dedicated endpoint labels. Additional v1.3 series: `s3proxy_in_flight_requests`, `s3proxy_resign_duration_seconds`, `s3proxy_gcs_errors_total{status_class}`. See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) and [`docs/SLO.md`](docs/SLO.md).
 - **Runtime Profiling**: Optional pprof endpoint. Set `PPROF_ADDR=127.0.0.1:6060` to enable (bound to a separate listener, never exposed through the main port or LoadBalancer).
 - **Reliable Timeouts**: Set timeouts on `http.Transport` to prevent hanging connections.
 - **Graceful Shutdown**: Listens for `SIGTERM`/`SIGINT` and waits up to 10s for draining requests.
 - **Prefix Isolation**: Use `GCS_PREFIX` for test isolation.
 - **DryRun Toggle**: Use `DRY_RUN=true` to disable real GCS API hits (safe for local laptop testing).
+
+### Compatibility Shims
+
+Some AWS S3 operations have no direct GCS equivalent but can be safely emulated at the proxy layer so legacy clients keep working without code changes:
+
+| Operation | Shim Behaviour | Notes |
+| :--- | :--- | :--- |
+| `POST /<bucket>/<key>?restore` (`RestoreObject`) | Returns `200 OK` for existing keys, `404 NoSuchKey` for missing keys, `501 NotImplemented` for non-POST verbs. | GCS objects in every storage class are directly readable, so there is no real "thaw" step. A single GCS HEAD probe is issued to preserve the 404 path; set `RESTORE_SKIP_EXISTENCE_CHECK=true` to skip it. Surfaced on the `restore_object` endpoint label in Prometheus. |
+
+GCS has no separate restore/thaw fee, but every `GetObject` on a `NEARLINE` / `COLDLINE` / `ARCHIVE` tier still incurs a per-read retrieval charge. Treating `RestoreObject` as a no-op does not hide that cost; keep an eye on retrieval spend when repeatedly reading cold data.
 
 ---
 

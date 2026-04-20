@@ -36,6 +36,14 @@ type Settings struct {
 	// on an independent port. MUST NOT be exposed publicly.
 	PPROFAddr string
 
+	// RestoreSkipExistenceCheck toggles the object HEAD probe inside the
+	// synthetic RestoreObject handler. Default false (probe enabled) so the
+	// proxy returns 404 NoSuchKey for missing keys, matching AWS S3 semantics.
+	// Set to true to short-circuit the probe when you are confident callers
+	// will follow the restore with a GET that can surface 404 on its own;
+	// useful for latency-sensitive workloads where the extra GCS HEAD matters.
+	RestoreSkipExistenceCheck bool
+
 	// Request data logging (SOH-delimited CSV file via ymlog)
 	ReqLogEnabled   bool   // REQUEST_LOG_ENABLED,      default true
 	ReqLogPath      string // REQUEST_LOG_PATH,          default "./logs/req_%Y%M%D.csv"
@@ -161,32 +169,33 @@ func LoadConfig() {
 	}
 
 	Config = &Settings{
-		Port:                  getEnv("PORT", "8080"),
-		GCPProjectID:          getEnv("GCP_PROJECT_ID", ""),
-		TargetBucket:          getEnv("TARGET_BUCKET", ""),
-		StorageBaseURL:        getEnv("STORAGE_BASE_URL", "https://storage.googleapis.com"),
-		GCSPrefix:             getEnv("GCS_PREFIX", ""),
-		DryRun:                dryRun,
-		DebugLogging:          debugLogging,
-		MaxIdleConns:          maxIdleConns,
-		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
-		MaxConcurrentRequests: maxConcurrentRequests,
-		GCSCallTimeout:        time.Duration(gcsCallTimeoutSec) * time.Second,
-		IdleConnTimeout:       time.Duration(idleConnTimeoutSec) * time.Second,
-		ResponseHeaderTimeout: time.Duration(responseHeaderTimeoutSec) * time.Second,
-		ReadBufferSize:        readBufferSize,
-		WriteBufferSize:       writeBufferSize,
-		ProxyAccessKey:        getEnv("PROXY_AWS_ACCESS_KEY_ID", getEnv("AWS_ACCESS_KEY_ID", "")),
-		ProxySecretKey:        getEnv("PROXY_AWS_SECRET_ACCESS_KEY", getEnv("AWS_SECRET_ACCESS_KEY", "")),
-		JSONKey:               getEnv("JSON_KEY", ""),
-		ProxyBaseDomain:       getEnv("PROXY_BASE_DOMAIN", ""),
-		PPROFAddr:             getEnv("PPROF_ADDR", ""),
-		ReqLogEnabled:         reqLogEnabled,
-		ReqLogPath:            getEnv("REQUEST_LOG_PATH", "./logs/req_%Y%M%D.csv"),
-		ReqLogMaxSizeMB:       reqLogMaxSizeMB,
-		ReqLogMaxBackup:       reqLogMaxBackup,
-		ReqLogChanBuf:         reqLogChanBuf,
-		ReqLogKeepDays:        reqLogKeepDays,
+		Port:                      getEnv("PORT", "8080"),
+		GCPProjectID:              getEnv("GCP_PROJECT_ID", ""),
+		TargetBucket:              getEnv("TARGET_BUCKET", ""),
+		StorageBaseURL:            getEnv("STORAGE_BASE_URL", "https://storage.googleapis.com"),
+		GCSPrefix:                 getEnv("GCS_PREFIX", ""),
+		DryRun:                    dryRun,
+		DebugLogging:              debugLogging,
+		MaxIdleConns:              maxIdleConns,
+		MaxIdleConnsPerHost:       maxIdleConnsPerHost,
+		MaxConcurrentRequests:     maxConcurrentRequests,
+		GCSCallTimeout:            time.Duration(gcsCallTimeoutSec) * time.Second,
+		IdleConnTimeout:           time.Duration(idleConnTimeoutSec) * time.Second,
+		ResponseHeaderTimeout:     time.Duration(responseHeaderTimeoutSec) * time.Second,
+		ReadBufferSize:            readBufferSize,
+		WriteBufferSize:           writeBufferSize,
+		ProxyAccessKey:            getEnv("PROXY_AWS_ACCESS_KEY_ID", getEnv("AWS_ACCESS_KEY_ID", "")),
+		ProxySecretKey:            getEnv("PROXY_AWS_SECRET_ACCESS_KEY", getEnv("AWS_SECRET_ACCESS_KEY", "")),
+		JSONKey:                   getEnv("JSON_KEY", ""),
+		ProxyBaseDomain:           getEnv("PROXY_BASE_DOMAIN", ""),
+		PPROFAddr:                 getEnv("PPROF_ADDR", ""),
+		RestoreSkipExistenceCheck: getEnv("RESTORE_SKIP_EXISTENCE_CHECK", "false") == "true",
+		ReqLogEnabled:             reqLogEnabled,
+		ReqLogPath:                getEnv("REQUEST_LOG_PATH", "./logs/req_%Y%M%D.csv"),
+		ReqLogMaxSizeMB:           reqLogMaxSizeMB,
+		ReqLogMaxBackup:           reqLogMaxBackup,
+		ReqLogChanBuf:             reqLogChanBuf,
+		ReqLogKeepDays:            reqLogKeepDays,
 	}
 
 	// Validate required fields for non-DryRun mode

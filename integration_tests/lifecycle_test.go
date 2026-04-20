@@ -45,8 +45,12 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to start proxy server: %v", err)
 	}
 
-	// 2. Wait for server to bind to port 8081
-	time.Sleep(2 * time.Second) // Give it time to boot up
+	// 2. Poll port 8081 until the proxy begins listening. The previous
+	// fixed 2-second sleep was brittle: when GCS warmup hits its 10s
+	// deadline (common on flaky networks) the binary only starts the
+	// HTTP listener ~10s after launch, long after 2s has elapsed.
+	// We give ourselves up to 20s so warmup has time to fail gracefully.
+	waitForListen("127.0.0.1:8081", 20*time.Second)
 
 	// 3. Run tests
 	code := m.Run()
@@ -58,6 +62,24 @@ func TestMain(m *testing.M) {
 	os.Remove("../s3proxy4gcs_test_bin") // Clean up binary!
 
 	os.Exit(code)
+}
+
+// waitForListen blocks until addr accepts a TCP connection or the overall
+// deadline elapses. Used in TestMain to bridge the gap between `cmd.Start()`
+// and the proxy's main listener becoming ready, which can take >10s when
+// the GCS warmup call times out. Keeps integration tests deterministic
+// without introducing arbitrary sleeps into individual cases.
+func waitForListen(addr string, max time.Duration) {
+	deadline := time.Now().Add(max)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	log.Fatalf("proxy did not begin listening on %s within %s", addr, max)
 }
 
 func TestPutLifecycleWithAWSSDK(t *testing.T) {

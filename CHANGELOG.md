@@ -4,6 +4,57 @@ All notable changes to the s3proxy4gcs project are documented in this file.
 Dates are in ISO-8601. Versions follow semver; log/metric label changes are
 listed under "Breaking (observability)" so downstream dashboards can adapt.
 
+## v1.5.0 — S3 compatibility shim: RestoreObject (2026-04-20)
+
+### Added
+- Synthetic handler for `POST /<bucket>/<key>?restore` (AWS S3
+  `RestoreObject`). GCS objects in every storage class are always directly
+  readable, so the proxy returns 200 OK with an empty body instead of
+  forwarding to GCS (which would reply 400 InvalidArgument). Legacy clients
+  that still call `RestoreObject` in a migration path keep working without
+  any code change.
+- `RESTORE_SKIP_EXISTENCE_CHECK` environment flag (`Settings.RestoreSkipExistenceCheck`,
+  default `false`). When `true`, the handler short-circuits the GCS HEAD
+  probe and returns 200 immediately. Useful for latency-sensitive
+  workloads that are willing to surface missing keys only on the next GET.
+- `restore_object` endpoint label in the Prometheus metrics
+  (`classifyEndpoint` in `pkg/metrics/metrics.go`). Separate from `proxy`
+  so operators can track how many callers still depend on the shim.
+- Non-POST verbs on `?restore` are rejected with `501 NotImplemented`
+  rather than silently forwarded, matching AGENTS rule 4
+  ("Reject Unsupported").
+- New unit tests in `main_test.go`:
+  - `TestHandleRestoreObject_HappyPath` — DryRun 200 path.
+  - `TestHandleRestoreObject_RejectsNonPOST` — GET/PUT/DELETE → 501.
+  - `TestHandleRestoreObject_BodySizeCap` — 64 KB cap enforced with
+    `MaxMessageLengthExceeded`.
+  - `TestHandleRestoreObject_RequiresBucketAndKey` — refuses
+    `/bucket/?restore` at the root.
+  - `TestHandleRestoreObject_SkipExistenceCheck` — opt-out bypasses the
+    GCS probe.
+- New package-level test `pkg/metrics/metrics_test.go` with
+  `TestClassifyEndpoint` covering the full low-cardinality label matrix
+  including the new `restore_object` case.
+- Integration test `integration_tests/restore_object_test.go` with three
+  sub-tests: AWS SDK Go V2 happy path on a real GCS object, signed raw
+  HTTP assertion of the `NoSuchKey` path, and GET ?restore → 501 rejection.
+
+### Changed
+- `observabilityMiddleware` now attaches a `handler=restore` label on
+  POST `?restore` requests so the structured access log mirrors the
+  Prometheus endpoint label.
+
+### Notes
+- Existence probe performs one extra Class B GCS operation
+  (`storage.Object.Attrs`) per RestoreObject call. This is negligible for
+  a call that is rare by nature; operators concerned about cost can set
+  `RESTORE_SKIP_EXISTENCE_CHECK=true`.
+- **Cost reminder**: GCS does not charge a restore/thaw fee, but every
+  `GetObject` on a `NEARLINE` / `COLDLINE` / `ARCHIVE` tier object
+  incurs a retrieval charge. Making `RestoreObject` a no-op does not
+  exempt callers from that charge; review whether "cold" data is being
+  read frequently enough to warrant an `Autoclass` or `STANDARD` tier.
+
 ## v1.4.0 — Correctness & code cleanup (2026-04-18)
 
 ### Added

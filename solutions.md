@@ -29,7 +29,7 @@ Choosing between a GLB Extension and a Cloud Run proxy depends on whether the fe
 
 **🟢 Perfect for GLB Extensions (Header/Routing Modification)**
 - **Versioning Interop**: Injecting the `x-amz-interop-list-objects-format: enabled` header upon request and mapping `x-goog-generation` to `x-amz-version-id` on the response.
-- **RestoreObject (Synthetic Responses)**: Immediately returning `200 OK` without hitting GCS, since objects are "live".
+- **RestoreObject (Synthetic Responses)**: Immediately returning `200 OK` without hitting GCS, since objects are "live". _Implemented in the Cloud Run proxy as of v1.5 with an optional HEAD existence probe so missing keys still return `404 NoSuchKey`._
 - **Proxy Protection (ABAC)**: Inspecting the URL to proactively reject unsupported requests like `PUT ?policy` with `501 Not Implemented`.
 - **Transparent Tag Translation**: Rewriting standard S3 `x-amz-tagging` upload headers into GCS custom metadata `x-goog-meta-s3tag-` instantly.
 
@@ -125,7 +125,8 @@ The proxy has been validated against **6 AWS SDKs** with full data-plane and con
 
 #### 6. RestoreObject
 **Issue**: Throws `InvalidArgument` against GCS.
-**Solution**: GCS objects in archive classes are considered "live" and do not require restoration. Client applications should remove calls to `RestoreObject`, or the proxy can be configured to intercept and return a synthetic `200 OK`.
+**Solution (Implemented, v1.5+)**: The proxy intercepts `POST /<bucket>/<key>?restore` and synthesises a `200 OK` response. GCS objects in every storage class (`STANDARD` / `NEARLINE` / `COLDLINE` / `ARCHIVE`) are directly readable without any thaw step, so the synthetic response is semantically equivalent to an "already restored" AWS S3 reply. Missing keys still return `404 NoSuchKey` so callers that immediately follow up with `GetObject` see a coherent story; set `RESTORE_SKIP_EXISTENCE_CHECK=true` to skip that HEAD probe in latency-sensitive workloads. Non-POST verbs on `?restore` are rejected with `501 NotImplemented`.
+**Cost note**: GCS does not charge a restore/thaw fee, but every `GetObject` on a colder tier still incurs a per-read retrieval charge. Making `RestoreObject` a no-op does not hide that cost; reassess storage class placement for frequently-read data.
 
 #### 7. Storage Classes
 **Issue**: GCS rejects AWS-specific storage class values (e.g., `STANDARD_IA`, `GLACIER`).

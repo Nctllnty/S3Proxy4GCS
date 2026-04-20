@@ -13,6 +13,7 @@ integration_tests/s3proxy4gcs_test_bin
 
 # log
 log/
+logs/
 
 # IDE / Tool cache
 .qoder/

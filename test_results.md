@@ -30,6 +30,6 @@ These features were assessed via `aws4gcs/test_report.md` and `solutions.md` fin
 | Category | Feature | Status | Workaround / Explanation |
 | :--- | :--- | :--- | :--- |
 | **Multipart** | `UploadPartCopy` | ❌ Fail | GCS limitation for cross-object multipart copies. |
-| **Restore** | `RestoreObject` | ❌ N/A | Coldline/Archive objects are "live" on GCS by default. No restore required. |
+| **Restore** | `RestoreObject` | ✅ Synthesised (v1.5+) | Proxy returns 200 OK for live keys / 404 NoSuchKey for missing keys / 501 for non-POST verbs. GCS archive objects are always directly readable; see `integration_tests/restore_object_test.go`. |
 | **Lifecycle** | `Reject unsupported filters` | ✅ Handled | Blocked with S3 XML error. |
 | **Integrity** | `aws-chunked` trailers | 🚫 Deferred | Use `AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED`. |

@@ -165,6 +165,146 @@ func TestDecodeControlPlaneXMLRejectsMalformed(t *testing.T) {
 	}
 }
 
+// TestHandleRestoreObject_HappyPath verifies the synthetic RestoreObject
+// shim returns 200 OK with an empty body when DryRun skips the GCS probe.
+// GCS objects are always immediately readable, so this is the baseline
+// behaviour legacy S3 callers need to keep working.
+func TestHandleRestoreObject_HappyPath(t *testing.T) {
+	if config.Config == nil {
+		config.Config = &config.Settings{}
+	}
+	config.Config.DryRun = true
+	defer func() { config.Config.DryRun = false }()
+
+	req := httptest.NewRequest(http.MethodPost, "/bucket/path/to/key?restore",
+		strings.NewReader(`<RestoreRequest><Days>1</Days></RestoreRequest>`))
+	rr := httptest.NewRecorder()
+
+	handleS3Request(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.Len() != 0 {
+		t.Errorf("expected empty body, got %q", rr.Body.String())
+	}
+	if cl := rr.Header().Get("Content-Length"); cl != "0" {
+		t.Errorf("Content-Length = %q, want 0", cl)
+	}
+	if rr.Header().Get("Date") == "" {
+		t.Error("expected Date header to be set for log correlation")
+	}
+}
+
+// TestHandleRestoreObject_RejectsNonPOST ensures only POST is allowed on
+// `?restore`; other verbs are refused with 501 NotImplemented rather than
+// silently falling through to the data-plane proxy (AGENTS rule 4).
+func TestHandleRestoreObject_RejectsNonPOST(t *testing.T) {
+	if config.Config == nil {
+		config.Config = &config.Settings{}
+	}
+	config.Config.DryRun = true
+	defer func() { config.Config.DryRun = false }()
+
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/bucket/key?restore", nil)
+			rr := httptest.NewRecorder()
+			handleS3Request(rr, req)
+			if rr.Code != http.StatusNotImplemented {
+				t.Fatalf("%s status = %d, want 501; body=%s", method, rr.Code, rr.Body.String())
+			}
+			var parsed s3ErrorBody
+			if err := xml.Unmarshal(rr.Body.Bytes(), &parsed); err != nil {
+				t.Fatalf("body not valid S3 XML: %v\nbody=%s", err, rr.Body.String())
+			}
+			if parsed.Code != "NotImplemented" {
+				t.Errorf("Code = %q, want NotImplemented", parsed.Code)
+			}
+		})
+	}
+}
+
+// TestHandleRestoreObject_BodySizeCap proves the shim honours the same
+// 64 KB request-body limit as the other control-plane handlers so a
+// malicious or buggy client cannot exhaust memory via an oversized
+// <RestoreRequest> XML document.
+func TestHandleRestoreObject_BodySizeCap(t *testing.T) {
+	if config.Config == nil {
+		config.Config = &config.Settings{}
+	}
+	config.Config.DryRun = true
+	defer func() { config.Config.DryRun = false }()
+
+	body := strings.Repeat("x", maxControlPlaneBodySize+1)
+	req := httptest.NewRequest(http.MethodPost, "/bucket/key?restore",
+		strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	handleS3Request(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "MaxMessageLengthExceeded") {
+		t.Errorf("expected MaxMessageLengthExceeded, got %s", rr.Body.String())
+	}
+}
+
+// TestHandleRestoreObject_RequiresBucketAndKey guards against proxy-level
+// routing mistakes: `?restore` without a key (e.g. on a bucket root) must
+// return 400 InvalidArgument, not 200, otherwise callers would think a
+// bucket-wide restore happened.
+func TestHandleRestoreObject_RequiresBucketAndKey(t *testing.T) {
+	if config.Config == nil {
+		config.Config = &config.Settings{}
+	}
+	config.Config.DryRun = true
+	defer func() { config.Config.DryRun = false }()
+
+	req := httptest.NewRequest(http.MethodPost, "/bucket/?restore", nil)
+	rr := httptest.NewRecorder()
+	handleS3Request(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+	var parsed s3ErrorBody
+	if err := xml.Unmarshal(rr.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("body not valid S3 XML: %v", err)
+	}
+	if parsed.Code != "InvalidArgument" {
+		t.Errorf("Code = %q, want InvalidArgument", parsed.Code)
+	}
+}
+
+// TestHandleRestoreObject_SkipExistenceCheck verifies that the
+// RESTORE_SKIP_EXISTENCE_CHECK opt-out does not attempt any GCS call.
+// We run this with DryRun=false + skip=true so the GCS client would
+// normally be dereferenced; success proves the branch exits early.
+func TestHandleRestoreObject_SkipExistenceCheck(t *testing.T) {
+	if config.Config == nil {
+		config.Config = &config.Settings{}
+	}
+	prevDryRun := config.Config.DryRun
+	prevSkip := config.Config.RestoreSkipExistenceCheck
+	config.Config.DryRun = false
+	config.Config.RestoreSkipExistenceCheck = true
+	defer func() {
+		config.Config.DryRun = prevDryRun
+		config.Config.RestoreSkipExistenceCheck = prevSkip
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/bucket/key?restore", nil)
+	rr := httptest.NewRecorder()
+	handleS3Request(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 when skipping existence check; body=%s",
+			rr.Code, rr.Body.String())
+	}
+}
+
 // TestDecodeControlPlaneXMLHappyPath sanity-checks the success path so the
 // guards above are not the only thing covered.
 func TestDecodeControlPlaneXMLHappyPath(t *testing.T) {
