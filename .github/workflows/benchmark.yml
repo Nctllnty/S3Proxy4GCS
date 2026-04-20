@@ -59,19 +59,31 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker us-east1-docker.pkg.dev --quiet
 
-      # ---- Build & Push S3Proxy Image ----
+      # ---- Multi-arch Build Setup ----
+      - name: Set up QEMU (for arm64 cross-build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ---- Build & Push S3Proxy Image (multi-arch) ----
       - name: Build and Push S3Proxy Image
         run: |
           IMAGE="${{ env.GAR_REGISTRY }}/s3proxy:${{ steps.meta.outputs.tag }}"
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag "$IMAGE" \
+            --push .
 
-      # ---- Build & Push Benchmark Image ----
+      # ---- Build & Push Benchmark Image (multi-arch) ----
       - name: Build and Push Benchmark Image
         run: |
           IMAGE="${{ env.GAR_REGISTRY }}/s3proxy-benchmark:${{ steps.meta.outputs.tag }}"
-          docker build -t "$IMAGE" -f e2e_tests/Dockerfile e2e_tests/
-          docker push "$IMAGE"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag "$IMAGE" \
+            --file e2e_tests/Dockerfile \
+            --push e2e_tests/
 
       # ---- Deploy S3Proxy to GKE ----
       - name: Get GKE Credentials

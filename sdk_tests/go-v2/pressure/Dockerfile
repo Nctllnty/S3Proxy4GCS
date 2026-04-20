@@ -3,7 +3,8 @@
 # the real internal-DNS view (ALB in Phase A, CNAME->GCS in Phase C).
 
 # ---- Stage 1: Build ----
-FROM golang:1.22-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS builder
+ARG TARGETOS TARGETARCH
 
 RUN apk add --no-cache git ca-certificates
 
@@ -12,7 +13,7 @@ COPY go.mod go.sum* ./
 RUN go mod download
 
 COPY main.go ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /pressure .
 
 # ---- Stage 2: Minimal runtime ----
