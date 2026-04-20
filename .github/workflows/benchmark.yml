@@ -86,9 +86,12 @@ jobs:
             --from-literal=TARGET_BUCKET=${{ secrets.TEST_BUCKET }} \
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
 
-          # Pin S3Proxy to the selected node pool (single-value nodeAffinity)
-          sed 's/- c3d-pool/- '"$PROXY_POOL"'/' k8s/deployment.yaml | \
+          # Pin S3Proxy to the selected node pool (single-value nodeAffinity).
+          # Use placeholder to avoid sed deleting the line we just wrote
+          # when PROXY_POOL equals "c4d-pool".
+          sed 's/- c3d-pool/- __POOL__/' k8s/deployment.yaml | \
             sed '/- c4d-pool/d' | \
+            sed 's/__POOL__/'"$PROXY_POOL"'/' | \
             kubectl apply -f -
 
           kubectl apply -f k8s/service.yaml
