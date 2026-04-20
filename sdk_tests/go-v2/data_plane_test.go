@@ -250,3 +250,118 @@ func TestStorageClass(t *testing.T) {
 		t.Fatalf("HeadObject failed: %v", err)
 	}
 }
+
+func TestCopyObject(t *testing.T) {
+	client := NewS3Client(t, testEnv)
+	bucket := testEnv.TestBucket
+	srcKey := GenerateTestKey(testEnv, "gov2-copy-src")
+	dstKey := GenerateTestKey(testEnv, "gov2-copy-dst")
+	content := "CopyObject test content"
+
+	t.Cleanup(func() { Cleanup(t, client, bucket, srcKey, dstKey) })
+
+	// Put source object
+	_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(srcKey),
+		Body: strings.NewReader(content),
+	})
+	if err != nil {
+		t.Fatalf("PutObject (source) failed: %v", err)
+	}
+
+	// CopyObject
+	_, err = client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String(dstKey),
+		CopySource: aws.String(bucket + "/" + srcKey),
+	})
+	if err != nil {
+		t.Fatalf("CopyObject failed: %v", err)
+	}
+
+	// Verify destination content
+	getOut, err := client.GetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(dstKey),
+	})
+	if err != nil {
+		t.Fatalf("GetObject (copy dest) failed: %v", err)
+	}
+	body, _ := io.ReadAll(getOut.Body)
+	getOut.Body.Close()
+	if string(body) != content {
+		t.Fatalf("CopyObject body mismatch: got %q, want %q", string(body), content)
+	}
+}
+
+func TestAbortMultipartUpload(t *testing.T) {
+	client := NewS3Client(t, testEnv)
+	bucket := testEnv.TestBucket
+	key := GenerateTestKey(testEnv, "gov2-abort-multipart")
+
+	t.Cleanup(func() { Cleanup(t, client, bucket, key) })
+
+	// Create multipart upload
+	createOut, err := client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload failed: %v", err)
+	}
+
+	// Upload a part
+	_, err = client.UploadPart(context.TODO(), &s3.UploadPartInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		UploadId: createOut.UploadId, PartNumber: aws.Int32(1),
+		Body: strings.NewReader(strings.Repeat("B", 5*1024*1024)),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart failed: %v", err)
+	}
+
+	// Abort the multipart upload
+	_, err = client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		UploadId: createOut.UploadId,
+	})
+	if err != nil {
+		t.Fatalf("AbortMultipartUpload failed: %v", err)
+	}
+
+	// Verify: ListParts should fail since upload is aborted
+	_, err = client.ListParts(context.TODO(), &s3.ListPartsInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		UploadId: createOut.UploadId,
+	})
+	if err == nil {
+		t.Fatal("ListParts after AbortMultipartUpload should have failed")
+	}
+}
+
+func TestRestoreObject(t *testing.T) {
+	client := NewS3Client(t, testEnv)
+	bucket := testEnv.TestBucket
+	key := GenerateTestKey(testEnv, "gov2-restore")
+
+	t.Cleanup(func() { Cleanup(t, client, bucket, key) })
+
+	// Put object with GLACIER storage class
+	_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket:       aws.String(bucket), Key: aws.String(key),
+		Body:         strings.NewReader("restore test content"),
+		StorageClass: types.StorageClassGlacier,
+	})
+	if err != nil {
+		t.Fatalf("PutObject with GLACIER failed: %v", err)
+	}
+
+	// RestoreObject — proxy returns synthetic 200/202
+	_, err = client.RestoreObject(context.TODO(), &s3.RestoreObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		RestoreRequest: &types.RestoreRequest{
+			Days: aws.Int32(7),
+		},
+	})
+	if err != nil {
+		t.Fatalf("RestoreObject failed: %v", err)
+	}
+}

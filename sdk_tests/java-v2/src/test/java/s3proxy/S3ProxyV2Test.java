@@ -195,6 +195,81 @@ public class S3ProxyV2Test {
         }
     }
 
+    @Test
+    @Order(6)
+    void testCopyObject() {
+        String srcKey = testKey("copy-src");
+        String dstKey = testKey("copy-dst");
+        String content = "CopyObject test content";
+
+        try {
+            s3.putObject(PutObjectRequest.builder().bucket(bucket).key(srcKey).build(),
+                    RequestBody.fromString(content));
+
+            s3.copyObject(CopyObjectRequest.builder()
+                    .sourceBucket(bucket).sourceKey(srcKey)
+                    .destinationBucket(bucket).destinationKey(dstKey)
+                    .build());
+
+            var getResp = s3.getObjectAsBytes(GetObjectRequest.builder().bucket(bucket).key(dstKey).build());
+            assertEquals(content, getResp.asUtf8String());
+        } finally {
+            try { s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(srcKey).build()); } catch (Exception ignored) {}
+            try { s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(dstKey).build()); } catch (Exception ignored) {}
+        }
+    }
+
+    @Test
+    @Order(7)
+    void testAbortMultipartUpload() {
+        String key = testKey("abort-multipart");
+
+        try {
+            var create = s3.createMultipartUpload(CreateMultipartUploadRequest.builder()
+                    .bucket(bucket).key(key).build());
+            String uploadId = create.uploadId();
+
+            byte[] partData = new byte[5 * 1024 * 1024];
+            java.util.Arrays.fill(partData, (byte) 'B');
+            s3.uploadPart(UploadPartRequest.builder()
+                    .bucket(bucket).key(key).uploadId(uploadId).partNumber(1)
+                    .contentLength((long) partData.length).build(), RequestBody.fromBytes(partData));
+
+            s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                    .bucket(bucket).key(key).uploadId(uploadId).build());
+
+            // ListParts should fail after abort
+            assertThrows(Exception.class, () ->
+                    s3.listParts(ListPartsRequest.builder()
+                            .bucket(bucket).key(key).uploadId(uploadId).build()));
+        } finally {
+            try { s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build()); } catch (Exception ignored) {}
+        }
+    }
+
+    @Test
+    @Order(8)
+    void testRestoreObject() {
+        String key = testKey("restore");
+
+        try {
+            s3.putObject(PutObjectRequest.builder()
+                            .bucket(bucket).key(key)
+                            .storageClass(StorageClass.GLACIER)
+                            .build(),
+                    RequestBody.fromString("restore test content"));
+
+            // RestoreObject — proxy returns synthetic 200/202
+            s3.restoreObject(RestoreObjectRequest.builder()
+                    .bucket(bucket).key(key)
+                    .restoreRequest(software.amazon.awssdk.services.s3.model.RestoreRequest.builder()
+                            .days(7).build())
+                    .build());
+        } finally {
+            try { s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build()); } catch (Exception ignored) {}
+        }
+    }
+
     // ---- Control Plane ----
 
     @Test

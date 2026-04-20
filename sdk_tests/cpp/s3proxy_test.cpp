@@ -20,6 +20,10 @@
 #include <aws/s3/model/CompleteMultipartUploadRequest.h>
 #include <aws/s3/model/CompletedMultipartUpload.h>
 #include <aws/s3/model/CompletedPart.h>
+#include <aws/s3/model/AbortMultipartUploadRequest.h>
+#include <aws/s3/model/ListPartsRequest.h>
+#include <aws/s3/model/CopyObjectRequest.h>
+#include <aws/s3/model/RestoreObjectRequest.h>
 #include <aws/s3/model/PutBucketLifecycleConfigurationRequest.h>
 #include <aws/s3/model/GetBucketLifecycleConfigurationRequest.h>
 #include <aws/s3/model/DeleteBucketLifecycleRequest.h>
@@ -320,6 +324,109 @@ TEST_F(S3ProxyTest, StorageClass) {
     headReq.SetKey(key);
     auto headResult = s3->HeadObject(headReq);
     ASSERT_TRUE(headResult.IsSuccess());
+
+    DeleteKey(key);
+}
+
+TEST_F(S3ProxyTest, CopyObject) {
+    auto srcKey = MakeTestKey(prefix, "copy-src");
+    auto dstKey = MakeTestKey(prefix, "copy-dst");
+    std::string content = "CopyObject test content";
+
+    // Put source
+    Aws::S3::Model::PutObjectRequest putReq;
+    putReq.SetBucket(bucket);
+    putReq.SetKey(srcKey);
+    auto body = Aws::MakeShared<Aws::StringStream>("put");
+    *body << content;
+    putReq.SetBody(body);
+    ASSERT_TRUE(s3->PutObject(putReq).IsSuccess());
+
+    // CopyObject
+    Aws::S3::Model::CopyObjectRequest copyReq;
+    copyReq.SetBucket(bucket);
+    copyReq.SetKey(dstKey);
+    copyReq.SetCopySource(bucket + "/" + srcKey);
+    auto copyResult = s3->CopyObject(copyReq);
+    ASSERT_TRUE(copyResult.IsSuccess()) << copyResult.GetError().GetMessage();
+
+    // Verify destination content
+    Aws::S3::Model::GetObjectRequest getReq;
+    getReq.SetBucket(bucket);
+    getReq.SetKey(dstKey);
+    auto getResult = s3->GetObject(getReq);
+    ASSERT_TRUE(getResult.IsSuccess());
+    std::stringstream ss;
+    ss << getResult.GetResult().GetBody().rdbuf();
+    ASSERT_EQ(ss.str(), content);
+
+    DeleteKey(srcKey);
+    DeleteKey(dstKey);
+}
+
+TEST_F(S3ProxyTest, AbortMultipartUpload) {
+    auto key = MakeTestKey(prefix, "abort-multipart");
+
+    Aws::S3::Model::CreateMultipartUploadRequest createReq;
+    createReq.SetBucket(bucket);
+    createReq.SetKey(key);
+    auto createResult = s3->CreateMultipartUpload(createReq);
+    ASSERT_TRUE(createResult.IsSuccess()) << createResult.GetError().GetMessage();
+    auto uploadId = createResult.GetResult().GetUploadId();
+
+    // Upload a part
+    std::string partData(5 * 1024 * 1024, 'B');
+    Aws::S3::Model::UploadPartRequest upReq;
+    upReq.SetBucket(bucket);
+    upReq.SetKey(key);
+    upReq.SetUploadId(uploadId);
+    upReq.SetPartNumber(1);
+    upReq.SetContentLength(partData.size());
+    auto upBody = Aws::MakeShared<Aws::StringStream>("up");
+    *upBody << partData;
+    upReq.SetBody(upBody);
+    ASSERT_TRUE(s3->UploadPart(upReq).IsSuccess());
+
+    // Abort
+    Aws::S3::Model::AbortMultipartUploadRequest abortReq;
+    abortReq.SetBucket(bucket);
+    abortReq.SetKey(key);
+    abortReq.SetUploadId(uploadId);
+    auto abortResult = s3->AbortMultipartUpload(abortReq);
+    ASSERT_TRUE(abortResult.IsSuccess()) << abortResult.GetError().GetMessage();
+
+    // ListParts should fail
+    Aws::S3::Model::ListPartsRequest listReq;
+    listReq.SetBucket(bucket);
+    listReq.SetKey(key);
+    listReq.SetUploadId(uploadId);
+    ASSERT_FALSE(s3->ListParts(listReq).IsSuccess());
+
+    DeleteKey(key);
+}
+
+TEST_F(S3ProxyTest, RestoreObject) {
+    auto key = MakeTestKey(prefix, "restore");
+
+    // Put with GLACIER storage class
+    Aws::S3::Model::PutObjectRequest putReq;
+    putReq.SetBucket(bucket);
+    putReq.SetKey(key);
+    putReq.SetStorageClass(Aws::S3::Model::StorageClass::GLACIER);
+    auto body = Aws::MakeShared<Aws::StringStream>("put");
+    *body << "restore test content";
+    putReq.SetBody(body);
+    ASSERT_TRUE(s3->PutObject(putReq).IsSuccess());
+
+    // RestoreObject — proxy returns synthetic 200/202
+    Aws::S3::Model::RestoreObjectRequest restoreReq;
+    restoreReq.SetBucket(bucket);
+    restoreReq.SetKey(key);
+    Aws::S3::Model::RestoreRequest rr;
+    rr.SetDays(7);
+    restoreReq.SetRestoreRequest(rr);
+    auto restoreResult = s3->RestoreObject(restoreReq);
+    ASSERT_TRUE(restoreResult.IsSuccess()) << restoreResult.GetError().GetMessage();
 
     DeleteKey(key);
 }

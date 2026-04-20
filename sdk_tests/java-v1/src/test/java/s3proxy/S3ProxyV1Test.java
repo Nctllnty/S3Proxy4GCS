@@ -188,6 +188,75 @@ public class S3ProxyV1Test {
         }
     }
 
+    @Test
+    @Order(6)
+    void testCopyObject() {
+        String srcKey = testKey("copy-src");
+        String dstKey = testKey("copy-dst");
+        String content = "CopyObject test content";
+
+        try {
+            s3.putObject(bucket, srcKey, content);
+
+            s3.copyObject(bucket, srcKey, bucket, dstKey);
+
+            S3Object obj = s3.getObject(bucket, dstKey);
+            String body = new String(readAll(obj.getObjectContent()), StandardCharsets.UTF_8);
+            assertEquals(content, body);
+        } finally {
+            try { s3.deleteObject(bucket, srcKey); } catch (Exception ignored) {}
+            try { s3.deleteObject(bucket, dstKey); } catch (Exception ignored) {}
+        }
+    }
+
+    @Test
+    @Order(7)
+    void testAbortMultipartUpload() {
+        String key = testKey("abort-multipart");
+
+        try {
+            InitiateMultipartUploadResult init = s3.initiateMultipartUpload(
+                    new InitiateMultipartUploadRequest(bucket, key));
+            String uploadId = init.getUploadId();
+
+            byte[] partData = new byte[5 * 1024 * 1024];
+            java.util.Arrays.fill(partData, (byte) 'B');
+            s3.uploadPart(new UploadPartRequest()
+                    .withBucketName(bucket).withKey(key).withUploadId(uploadId)
+                    .withPartNumber(1).withInputStream(new ByteArrayInputStream(partData))
+                    .withPartSize(partData.length));
+
+            s3.abortMultipartUpload(new AbortMultipartUploadRequest(bucket, key, uploadId));
+
+            // ListParts should fail after abort
+            assertThrows(AmazonS3Exception.class, () ->
+                    s3.listParts(new ListPartsRequest(bucket, key, uploadId)));
+        } finally {
+            try { s3.deleteObject(bucket, key); } catch (Exception ignored) {}
+        }
+    }
+
+    @Test
+    @Order(8)
+    void testRestoreObject() {
+        String key = testKey("restore");
+
+        try {
+            ObjectMetadata metadata = new ObjectMetadata();
+            metadata.setContentLength(20);
+            PutObjectRequest putReq = new PutObjectRequest(bucket, key,
+                    new ByteArrayInputStream("restore test content".getBytes(StandardCharsets.UTF_8)), metadata);
+            putReq.setStorageClass("GLACIER");
+            s3.putObject(putReq);
+
+            // RestoreObject — proxy returns synthetic 200/202
+            s3.restoreObjectV2(new RestoreObjectRequest(bucket, key)
+                    .withExpirationInDays(7));
+        } finally {
+            try { s3.deleteObject(bucket, key); } catch (Exception ignored) {}
+        }
+    }
+
     // ---- Control Plane ----
 
     @Test

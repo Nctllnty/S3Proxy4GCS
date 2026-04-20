@@ -1,7 +1,18 @@
-name: Multi-SDK Compatibility Tests
+name: Multi-SDK E2E Tests
 
 on:
   workflow_dispatch:
+    inputs:
+      stability_rounds:
+        description: 'Number of stability test rounds'
+        required: false
+        default: '50'
+        type: string
+      concurrency:
+        description: 'Concurrency level for stability tests'
+        required: false
+        default: '10'
+        type: string
 
 env:
   GKE_CLUSTER: s3proxy-e2e
@@ -55,12 +66,10 @@ jobs:
         run: |
           IMAGE="${{ env.GAR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}"
           kubectl apply -f k8s/namespace.yaml
-          # Ensure credentials secret exists
           kubectl create secret generic s3proxy-credentials \
             --from-literal=PROXY_AWS_ACCESS_KEY_ID=${{ secrets.GCS_HMAC_ACCESS }} \
             --from-literal=PROXY_AWS_SECRET_ACCESS_KEY=${{ secrets.GCS_HMAC_SECRET }} \
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-          # Ensure bucket config secret exists
           kubectl create secret generic s3proxy-config \
             --from-literal=TARGET_BUCKET=${{ secrets.TEST_BUCKET }} \
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
@@ -91,7 +100,7 @@ jobs:
           exit 1
 
   # ================================================================
-  # Job 2: Go V2 SDK Tests (v1.75.1)
+  # Job 2: Go V2 SDK Tests
   # ================================================================
   test-go-v2:
     name: "Go V2 (v1.75.1)"
@@ -148,7 +157,7 @@ jobs:
           path: sdk_tests/go-v2/test-output.txt
 
   # ================================================================
-  # Job 3: Go V1 SDK Tests (v1.50.0)
+  # Job 3: Go V1 SDK Tests
   # ================================================================
   test-go-v1:
     name: "Go V1 (v1.50.0)"
@@ -206,7 +215,7 @@ jobs:
           path: sdk_tests/go-v1/test-output.txt
 
   # ================================================================
-  # Job 4: Python SDK Tests (boto3 1.42.71)
+  # Job 4: Python SDK Tests
   # ================================================================
   test-python:
     name: "Python (boto3 1.42.71)"
@@ -270,7 +279,7 @@ jobs:
             sdk_tests/python/test-output.txt
 
   # ================================================================
-  # Job 5: Java V1 SDK Tests (1.12.500)
+  # Job 5: Java V1 SDK Tests
   # ================================================================
   test-java-v1:
     name: "Java V1 (1.12.500)"
@@ -331,7 +340,7 @@ jobs:
             sdk_tests/java-v1/test-output.txt
 
   # ================================================================
-  # Job 6: Java V2 SDK Tests (2.20.0)
+  # Job 6: Java V2 SDK Tests
   # ================================================================
   test-java-v2:
     name: "Java V2 (2.20.0)"
@@ -394,7 +403,7 @@ jobs:
             sdk_tests/java-v2/test-output.txt
 
   # ================================================================
-  # Job 7: C++ SDK Tests (1.11.765)
+  # Job 7: C++ SDK Tests
   # ================================================================
   test-cpp:
     name: "C++ (1.11.765)"
@@ -409,7 +418,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake g++ libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev
-          # Install AWS SDK C++ via vcpkg
           git clone --depth 1 https://github.com/microsoft/vcpkg.git /tmp/vcpkg
           /tmp/vcpkg/bootstrap-vcpkg.sh
           /tmp/vcpkg/vcpkg install "aws-sdk-cpp[s3]" --triplet x64-linux
@@ -467,12 +475,81 @@ jobs:
           path: sdk_tests/cpp/test-output.txt
 
   # ================================================================
-  # Job 8: Summary Report
+  # Job 8: Stability Tests (Go V2 SDK - deep validation)
+  # ================================================================
+  stability:
+    name: Stability Tests (Go V2)
+    runs-on: ubuntu-latest
+    needs: test-cpp
+    if: always() && needs.test-cpp.result != 'cancelled'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: e2e_tests/go.sum
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Get GKE Credentials & Setup Local Domain Alias
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+            --region ${{ env.GKE_REGION }} --project cbs-poctest
+          echo "127.0.0.1 s3proxy.lb.local" | sudo tee -a /etc/hosts
+          kubectl port-forward deployment/s3proxy 8080:8080 -n ${{ env.K8S_NAMESPACE }} >/tmp/s3proxy-portforward.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://s3proxy.lb.local:8080/readyz > /dev/null 2>&1; then
+              echo "Proxy is ready!"
+              break
+            fi
+            echo "Waiting for local alias + port-forward... ($i/30)"
+            sleep 2
+          done
+
+      - name: Run Stability Tests
+        working-directory: e2e_tests
+        env:
+          PROXY_ENDPOINT: http://s3proxy.lb.local:8080
+          GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
+          GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
+          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+          TEST_PREFIX: "e2e-stability-${{ github.run_id }}/"
+          STABILITY_ROUNDS: ${{ inputs.stability_rounds }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+        run: |
+          go test -v -count=1 -timeout 20m \
+            -run 'TestLongRunningCRUD|TestConcurrentOperations|TestControlPlaneConcurrency' \
+            ./...
+
+      - name: Run Ops Tests
+        working-directory: e2e_tests
+        env:
+          PROXY_ENDPOINT: http://s3proxy.lb.local:8080
+          GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
+          GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
+          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+          TEST_PREFIX: "e2e-ops-${{ github.run_id }}/"
+        run: |
+          go test -v -count=1 -timeout 5m \
+            -run 'TestHealthEndpoint|TestReadyzEndpoint|TestMetricsEndpoint' \
+            ./...
+
+  # ================================================================
+  # Job 9: Summary Report
   # ================================================================
   report:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [test-go-v2, test-go-v1, test-python, test-java-v1, test-java-v2, test-cpp]
+    needs: [test-go-v2, test-go-v1, test-python, test-java-v1, test-java-v2, test-cpp, stability]
     if: always()
     steps:
       - name: Download All Artifacts
@@ -482,25 +559,24 @@ jobs:
 
       - name: Generate Summary
         run: |
-          echo "# Multi-SDK Compatibility Test Report" >> $GITHUB_STEP_SUMMARY
+          echo "# Multi-SDK E2E Test Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Stability Rounds:** ${{ inputs.stability_rounds }} | **Concurrency:** ${{ inputs.concurrency }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| SDK | Version | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|---------|--------|" >> $GITHUB_STEP_SUMMARY
 
           check_result() {
-            local name="$1" version="$2" dir="$3" job_name="$4"
+            local name="$1" version="$2" dir="$3"
             if [ -d "results/$dir" ]; then
               local failed=false
-              # Go: check for "FAIL" at line start or "--- FAIL:"
               if echo "$dir" | grep -q "go-"; then
                 grep -qE '^FAIL|--- FAIL:' "results/$dir/test-output.txt" 2>/dev/null && failed=true
-              # Python: check for "FAILED" or "ERROR" in pytest summary
               elif echo "$dir" | grep -q "python"; then
                 grep -qE '(FAILED|ERROR)' "results/$dir/test-output.txt" 2>/dev/null && failed=true
-              # Java: check for "BUILD FAILURE" or "Tests run:.*Failures: [1-9]"
               elif echo "$dir" | grep -q "java"; then
                 grep -qE 'BUILD FAILURE|Failures: [1-9]|Errors: [1-9]' "results/$dir/test-output.txt" 2>/dev/null && failed=true
-              # C++: check for "FAILED" from gtest
               elif echo "$dir" | grep -q "cpp"; then
                 grep -qE '\[  FAILED  \]' "results/$dir/test-output.txt" 2>/dev/null && failed=true
               fi
@@ -522,6 +598,10 @@ jobs:
           check_result "C++" "1.11.765" "cpp-results"
 
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Stability Tests | ${{ needs.stability.result == 'success' && ':white_check_mark: PASS' || needs.stability.result == 'skipped' && ':warning: SKIP' || ':x: FAIL' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "Triggered by: \`${{ github.event_name }}\` on \`${{ github.ref }}\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Fail if any SDK had failures
@@ -537,5 +617,10 @@ jobs:
           done
           if $ANY_FAIL; then
             echo "One or more SDK tests failed. Marking workflow as failed."
+            exit 1
+          fi
+          # Also fail if stability failed
+          if [ "${{ needs.stability.result }}" = "failure" ]; then
+            echo "::error::Stability tests failed"
             exit 1
           fi
