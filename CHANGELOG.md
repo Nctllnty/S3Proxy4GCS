@@ -4,6 +4,61 @@ All notable changes to the s3proxy4gcs project are documented in this file.
 Dates are in ISO-8601. Versions follow semver; log/metric label changes are
 listed under "Breaking (observability)" so downstream dashboards can adapt.
 
+## v1.6.0 — Three-plane feature flags (2026-04-20)
+
+### Added
+- 13 `ENABLE_*` environment variables (all default `true`) controlling
+  every externally-visible operation of the proxy. Disabling a control- or
+  data-plane flag returns `501 NotImplemented` at dispatch entry — before
+  any body parsing, XML decode, GCS call, or reverse-proxy forwarding —
+  so the proxy can be locked down to a subset of capabilities without
+  relying on network policy or IAM.
+  - **Control plane (6)**: `ENABLE_LIFECYCLE`, `ENABLE_CORS`, `ENABLE_LOGGING`,
+    `ENABLE_WEBSITE`, `ENABLE_TAGGING`, `ENABLE_RESTORE_OBJECT`. Each flag
+    gates PUT / GET / DELETE on its subresource as one unit.
+  - **Data plane, composite only (3)**: `ENABLE_COPY_OBJECT` (PUT with
+    `x-amz-copy-source`, covers both `CopyObject` and `UploadPartCopy`),
+    `ENABLE_MULTIPART_UPLOAD` (any of `?uploads`, `?uploadId`,
+    `?partNumber`), `ENABLE_DELETE_OBJECTS` (POST `?delete`). Basic
+    object CRUD (Get/Put/Head/Delete/List/ListBuckets) is intentionally
+    always-on — turning it off would make the proxy useless and is better
+    enforced at the network or IAM layer.
+  - **Ops plane (3)**: `ENABLE_HEALTH_ENDPOINT`, `ENABLE_READYZ_ENDPOINT`,
+    `ENABLE_METRICS_ENDPOINT`. When off, the endpoint is replaced with a
+    404 stub (not left unregistered) so requests do not fall through to
+    the S3 catch-all and get classified as bucket reads.
+- `s3proxy_feature_disabled_rejections_total{feature}` Prometheus counter
+  — one low-cardinality label per feature name, incremented on every
+  rejection.
+- Startup `Feature flags` info log summarises the state of all 12 flags;
+  extra WARN lines for any disabled ops endpoint so operators are not
+  surprised by K8s probe / Prometheus scrape failures.
+- Unit coverage in `main_test.go`: 6 control-plane gates, 5 data-plane
+  composite request permutations, dispatch-priority sanity check (copy
+  beats multipart when both match), 3 ops-endpoint 404 stubs, and an
+  "allow path is side-effect-free" guard on `ensureFeatureEnabled`. New
+  metric smoke test in `pkg/metrics/metrics_test.go`.
+- `config.FeatureFlags` struct and `getEnvBool` helper in
+  `config/settings.go`. `getEnvBool` rejects invalid boolean strings with
+  a startup WARN instead of silently falling back, so typos cannot
+  accidentally disable critical features.
+
+### Changed
+- `.env.example` extended with a dedicated "Feature Flags" section
+  documenting each variable, its default, and the operator-facing impact
+  (especially the risk of turning off `/health`, `/readyz`, `/metrics`).
+- `AGENTS.md` rule 14: any new operation MUST be wired through
+  `ensureFeatureEnabled` / `featureDisabled404` with a corresponding
+  `FeatureFlags` field — there are no ungated code paths going forward.
+
+### Notes
+- Flags default to `true`, so zero-config upgrades from v1.5 retain every
+  behaviour. A `config` unit test injects all-true defaults via `TestMain`
+  so the pre-existing suite never trips over zero-value flags.
+- `501 NotImplemented` was chosen over `403 AccessDenied` because AWS
+  SDKs interpret 403 as an authentication problem and may enter retry /
+  credential-refresh loops, whereas 501 is terminal and unambiguous.
+
 ## v1.5.0 — S3 compatibility shim: RestoreObject (2026-04-20)
 
 ### Added

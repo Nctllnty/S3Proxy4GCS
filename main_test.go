@@ -5,11 +5,41 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"s3proxy4gcs/config"
+	"s3proxy4gcs/pkg/metrics"
+
+	dto "github.com/prometheus/client_model/go"
 )
+
+// TestMain initialises `config.Config` with production-default feature
+// flags (all enabled) so pre-existing unit tests — which never knew about
+// feature gating — keep seeing their handlers executed. Tests that want to
+// flip a flag off call `withAllFeaturesEnabled` and then disable the one
+// under test, with the helper restoring state on cleanup.
+func TestMain(m *testing.M) {
+	if config.Config == nil {
+		config.Config = &config.Settings{}
+	}
+	config.Config.Features = config.FeatureFlags{
+		Lifecycle:       true,
+		CORS:            true,
+		Logging:         true,
+		Website:         true,
+		Tagging:         true,
+		RestoreObject:   true,
+		CopyObject:      true,
+		MultipartUpload: true,
+		DeleteObjects:   true,
+		HealthEndpoint:  true,
+		ReadyzEndpoint:  true,
+		MetricsEndpoint: true,
+	}
+	os.Exit(m.Run())
+}
 
 // TestWriteS3ErrorEscapesXML verifies that writeS3Error produces well-formed
 // XML even when the message contains special characters. Prior to v1.4 the
@@ -302,6 +332,274 @@ func TestHandleRestoreObject_SkipExistenceCheck(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 when skipping existence check; body=%s",
 			rr.Code, rr.Body.String())
+	}
+}
+
+// withAllFeaturesEnabled sets every ENABLE_* flag to true (the product
+// default) for the duration of a test, and restores the previous state on
+// cleanup. Using this per-test helper keeps feature-flag assertions
+// independent of ordering.
+func withAllFeaturesEnabled(t *testing.T) {
+	t.Helper()
+	if config.Config == nil {
+		config.Config = &config.Settings{}
+	}
+	prev := config.Config.Features
+	config.Config.Features = config.FeatureFlags{
+		Lifecycle:       true,
+		CORS:            true,
+		Logging:         true,
+		Website:         true,
+		Tagging:         true,
+		RestoreObject:   true,
+		CopyObject:      true,
+		MultipartUpload: true,
+		DeleteObjects:   true,
+		HealthEndpoint:  true,
+		ReadyzEndpoint:  true,
+		MetricsEndpoint: true,
+	}
+	t.Cleanup(func() { config.Config.Features = prev })
+}
+
+// counterValue returns the current value of a metric counter vector cell,
+// returning 0 if the label combination has not yet been observed. Used to
+// assert the feature-disabled rejection counter increments exactly once
+// per rejected request without relying on a global reset.
+func counterValue(t *testing.T, c *dto.Metric) float64 {
+	t.Helper()
+	if c == nil || c.Counter == nil || c.Counter.Value == nil {
+		return 0
+	}
+	return *c.Counter.Value
+}
+
+func featureDisabledCount(t *testing.T, feature string) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	if err := metrics.FeatureDisabledRejections.WithLabelValues(feature).Write(m); err != nil {
+		t.Fatalf("metric write failed: %v", err)
+	}
+	return counterValue(t, m)
+}
+
+// TestFeatureFlags_ControlPlane verifies that each control-plane resource
+// family is individually gated. When the corresponding flag is false the
+// matching `handleS3Request` branch MUST return 501 NotImplemented with a
+// well-formed S3 XML error and increment the rejection counter exactly
+// once — without reaching the underlying handler (which would try to touch
+// gcsClient and panic in DryRun).
+func TestFeatureFlags_ControlPlane(t *testing.T) {
+	if config.Config == nil {
+		config.Config = &config.Settings{}
+	}
+
+	cases := []struct {
+		feature string
+		off     func()
+		method  string
+		uri     string
+	}{
+		{"lifecycle", func() { config.Config.Features.Lifecycle = false }, http.MethodPut, "/bucket/?lifecycle"},
+		{"cors", func() { config.Config.Features.CORS = false }, http.MethodGet, "/bucket/?cors"},
+		{"logging", func() { config.Config.Features.Logging = false }, http.MethodDelete, "/bucket/?logging"},
+		{"website", func() { config.Config.Features.Website = false }, http.MethodPut, "/bucket/?website"},
+		{"tagging", func() { config.Config.Features.Tagging = false }, http.MethodGet, "/bucket/key?tagging"},
+		{"restore_object", func() { config.Config.Features.RestoreObject = false }, http.MethodPost, "/bucket/key?restore"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.feature, func(t *testing.T) {
+			withAllFeaturesEnabled(t)
+			// Flip just the one under test to off. The helper leaves the
+			// rest true so a regression in another branch will not mask
+			// this assertion.
+			tc.off()
+
+			before := featureDisabledCount(t, tc.feature)
+
+			req := httptest.NewRequest(tc.method, tc.uri, nil)
+			rr := httptest.NewRecorder()
+			handleS3Request(rr, req)
+
+			if rr.Code != http.StatusNotImplemented {
+				t.Fatalf("status = %d, want 501; body=%s", rr.Code, rr.Body.String())
+			}
+			var parsed s3ErrorBody
+			if err := xml.Unmarshal(rr.Body.Bytes(), &parsed); err != nil {
+				t.Fatalf("body not valid S3 XML: %v\nbody=%s", err, rr.Body.String())
+			}
+			if parsed.Code != "NotImplemented" {
+				t.Errorf("Code = %q, want NotImplemented", parsed.Code)
+			}
+			if !strings.Contains(parsed.Message, tc.feature) {
+				t.Errorf("Message %q should reference feature %q", parsed.Message, tc.feature)
+			}
+
+			got := featureDisabledCount(t, tc.feature)
+			if got != before+1 {
+				t.Errorf("rejection counter = %v, want %v (before=%v)", got, before+1, before)
+			}
+		})
+	}
+}
+
+// TestFeatureFlags_DataPlaneComposites verifies the three high-cost
+// data-plane operations (CopyObject, Multipart, DeleteObjects) can each
+// be disabled independently and return 501 instead of being forwarded to
+// the reverse proxy.
+func TestFeatureFlags_DataPlaneComposites(t *testing.T) {
+	type tc struct {
+		feature string
+		method  string
+		uri     string
+		header  http.Header
+	}
+
+	cases := []tc{
+		{
+			feature: "copy_object",
+			method:  http.MethodPut,
+			uri:     "/dst-bucket/dst-key",
+			header:  http.Header{"X-Amz-Copy-Source": {"/src-bucket/src-key"}},
+		},
+		{
+			feature: "multipart_upload",
+			method:  http.MethodPost,
+			uri:     "/bucket/key?uploads",
+		},
+		{
+			feature: "multipart_upload",
+			method:  http.MethodPut,
+			uri:     "/bucket/key?partNumber=1&uploadId=abc",
+		},
+		{
+			feature: "multipart_upload",
+			method:  http.MethodPost,
+			uri:     "/bucket/key?uploadId=abc",
+		},
+		{
+			feature: "delete_objects",
+			method:  http.MethodPost,
+			uri:     "/bucket/?delete",
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.feature+"__"+c.method+"_"+strings.ReplaceAll(c.uri, "/", "_"), func(t *testing.T) {
+			withAllFeaturesEnabled(t)
+			switch c.feature {
+			case "copy_object":
+				config.Config.Features.CopyObject = false
+			case "multipart_upload":
+				config.Config.Features.MultipartUpload = false
+			case "delete_objects":
+				config.Config.Features.DeleteObjects = false
+			}
+
+			before := featureDisabledCount(t, c.feature)
+
+			req := httptest.NewRequest(c.method, c.uri, nil)
+			for k, v := range c.header {
+				req.Header[k] = v
+			}
+			rr := httptest.NewRecorder()
+			handleS3Request(rr, req)
+
+			if rr.Code != http.StatusNotImplemented {
+				t.Fatalf("status = %d, want 501; body=%s", rr.Code, rr.Body.String())
+			}
+			var parsed s3ErrorBody
+			if err := xml.Unmarshal(rr.Body.Bytes(), &parsed); err != nil {
+				t.Fatalf("body not valid S3 XML: %v\nbody=%s", err, rr.Body.String())
+			}
+			if parsed.Code != "NotImplemented" {
+				t.Errorf("Code = %q, want NotImplemented", parsed.Code)
+			}
+			if got := featureDisabledCount(t, c.feature); got != before+1 {
+				t.Errorf("rejection counter = %v, want %v", got, before+1)
+			}
+		})
+	}
+}
+
+// TestFeatureFlags_DataPlaneCompositeDispatchPriority ensures that when
+// a request hits more than one composite detector (e.g. PUT with
+// x-amz-copy-source AND ?partNumber=1&uploadId=X, which is UploadPartCopy),
+// the copy-object gate runs first and its rejection supersedes the
+// multipart check. This keeps operator intent — "block all server-side
+// copies" — honoured even during multipart workflows.
+func TestFeatureFlags_DataPlaneCompositeDispatchPriority(t *testing.T) {
+	withAllFeaturesEnabled(t)
+	config.Config.Features.CopyObject = false
+	// Multipart stays true; copy_object should fire first.
+
+	before := featureDisabledCount(t, "copy_object")
+
+	req := httptest.NewRequest(http.MethodPut,
+		"/bucket/key?partNumber=1&uploadId=abc", nil)
+	req.Header.Set("X-Amz-Copy-Source", "/src/key")
+	rr := httptest.NewRecorder()
+	handleS3Request(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 via copy_object gate", rr.Code)
+	}
+	var parsed s3ErrorBody
+	_ = xml.Unmarshal(rr.Body.Bytes(), &parsed)
+	if !strings.Contains(parsed.Message, "copy_object") {
+		t.Errorf("expected copy_object to be the rejecting feature, got %q", parsed.Message)
+	}
+	if got := featureDisabledCount(t, "copy_object"); got != before+1 {
+		t.Errorf("copy_object counter = %v, want %v", got, before+1)
+	}
+}
+
+// TestFeatureDisabled404 verifies the ops-plane stub handler used when a
+// /health /readyz /metrics flag is disabled: 404 status, plain-text body
+// mentioning the feature, and counter increment.
+func TestFeatureDisabled404(t *testing.T) {
+	for _, feat := range []string{"health_endpoint", "readyz_endpoint", "metrics_endpoint"} {
+		feat := feat
+		t.Run(feat, func(t *testing.T) {
+			before := featureDisabledCount(t, feat)
+
+			handler := featureDisabled404(feat)
+			rr := httptest.NewRecorder()
+			handler(rr, httptest.NewRequest(http.MethodGet, "/"+feat, nil))
+
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", rr.Code)
+			}
+			if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+				t.Errorf("content-type = %q, want text/plain", ct)
+			}
+			if !strings.Contains(rr.Body.String(), feat) {
+				t.Errorf("body %q should mention feature %q", rr.Body.String(), feat)
+			}
+			if got := featureDisabledCount(t, feat); got != before+1 {
+				t.Errorf("counter = %v, want %v", got, before+1)
+			}
+		})
+	}
+}
+
+// TestEnsureFeatureEnabled_Allow ensures the happy path returns true and
+// makes no side effects (no counter increment, nothing written).
+func TestEnsureFeatureEnabled_Allow(t *testing.T) {
+	before := featureDisabledCount(t, "lifecycle")
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/bucket/?lifecycle", nil)
+	if !ensureFeatureEnabled(rr, req, true, "lifecycle") {
+		t.Fatal("expected allow=true when enabled=true")
+	}
+	if rr.Body.Len() != 0 {
+		t.Errorf("expected no body written, got %q", rr.Body.String())
+	}
+	if got := featureDisabledCount(t, "lifecycle"); got != before {
+		t.Errorf("counter changed from %v to %v when feature enabled", before, got)
 	}
 }
 

@@ -411,36 +411,47 @@ func main() {
 		slog.Warn("Concurrency throttle DISABLED (MAX_CONCURRENT_REQUESTS=0)")
 	}
 
-	// Operational endpoints (excluded from S3 routing)
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if config.Config.DryRun {
+	// Operational endpoints (excluded from S3 routing).
+	// Each endpoint is registered only when its feature flag is enabled so
+	// the catch-all S3 route never picks up /health or /readyz. When a flag
+	// is off we register a 404 stub to avoid the request being classified as
+	// a bucket-level S3 call by the metrics endpoint label.
+	if config.Config.Features.HealthEndpoint {
+		r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"status":"ready","mode":"dry_run"}`))
-			return
-		}
-		if gcsClient == nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"status":"not_ready","reason":"gcs_client_nil"}`))
-			return
-		}
-		// Lightweight check: fetch bucket attrs to verify connectivity
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		_, err := gcsClient.Bucket(config.Config.TargetBucket).Attrs(ctx)
-		if err != nil {
-			slog.Error("Readiness check failed", "error", err)
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"status":"not_ready","reason":"gcs_connectivity_failed"}`))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ready","mode":"live"}`))
-	})
+			w.Write([]byte("OK"))
+		})
+	} else {
+		r.Get("/health", featureDisabled404("health_endpoint"))
+	}
+
+	if config.Config.Features.ReadyzEndpoint {
+		r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
+			if config.Config.DryRun {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"status":"ready","mode":"dry_run"}`))
+				return
+			}
+			if gcsClient == nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte(`{"status":"not_ready","reason":"gcs_client_nil"}`))
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			_, err := gcsClient.Bucket(config.Config.TargetBucket).Attrs(ctx)
+			if err != nil {
+				slog.Error("Readiness check failed", "error", err)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte(`{"status":"not_ready","reason":"gcs_connectivity_failed"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ready","mode":"live"}`))
+		})
+	} else {
+		r.Get("/readyz", featureDisabled404("readyz_endpoint"))
+	}
 
 	// Pass-through or intercept handlers
 	r.Route("/", func(r chi.Router) {
@@ -456,7 +467,14 @@ func main() {
 	// Prometheus scrapes are never accounted for as S3 traffic and are not
 	// affected by the throttle or observability middleware.
 	rootMux := http.NewServeMux()
-	rootMux.Handle("/metrics", promhttp.Handler())
+	if config.Config.Features.MetricsEndpoint {
+		rootMux.Handle("/metrics", promhttp.Handler())
+	} else {
+		// When disabled we still claim the path so a request for /metrics is
+		// returned as a 404 rather than being delegated to chi and parsed as
+		// a bucket-level S3 call (which would pollute request metrics).
+		rootMux.HandleFunc("/metrics", featureDisabled404("metrics_endpoint"))
+	}
 	rootMux.Handle("/", r)
 
 	srv := &http.Server{
@@ -601,6 +619,46 @@ func reqLogger(ctx context.Context) *slog.Logger {
 	return slog.Default().With("request_id", reqID)
 }
 
+// featureDisabled404 returns an http.HandlerFunc that records the rejection
+// in `s3proxy_feature_disabled_rejections_total{feature=...}` and responds
+// with a plain 404. Used for operational endpoints (`/health`, `/readyz`,
+// `/metrics`) whose consumers are K8s kubelets and Prometheus — neither
+// parses S3 XML error bodies, so a minimal text 404 is sufficient and
+// avoids suggesting the path is a valid bucket.
+func featureDisabled404(feature string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		metrics.FeatureDisabledRejections.WithLabelValues(feature).Inc()
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "endpoint %q is disabled on this proxy\n", feature)
+	}
+}
+
+// ensureFeatureEnabled returns true when the operation is allowed. When
+// disabled it writes a `501 NotImplemented` S3 error, logs a WARN and
+// increments `s3proxy_feature_disabled_rejections_total{feature=...}`.
+//
+// Every feature-flag branch (control plane subresource, data-plane composite,
+// operational endpoint) MUST call this helper so the rejection path is
+// uniform: same status code, same XML schema, same metric. Status 501 is
+// used — rather than 403 — because AWS SDKs interpret 403 as an
+// authentication problem and may enter a retry/refresh loop, whereas 501 is
+// terminal for compatibility callers.
+func ensureFeatureEnabled(w http.ResponseWriter, r *http.Request, enabled bool, feature string) bool {
+	if enabled {
+		return true
+	}
+	metrics.FeatureDisabledRejections.WithLabelValues(feature).Inc()
+	reqLogger(r.Context()).Warn("Feature disabled by configuration",
+		"feature", feature,
+		"method", r.Method,
+		"uri", r.RequestURI,
+	)
+	writeS3Error(w, http.StatusNotImplemented, "NotImplemented",
+		fmt.Sprintf("The %q operation is disabled on this proxy.", feature))
+	return false
+}
+
 // timeGCSCall executes a GCS SDK call with an optional per-call timeout,
 // logs and records its duration. The fn receives a context that may have
 // a deadline applied (controlled by GCS_CALL_TIMEOUT_SEC, default 30s).
@@ -738,6 +796,9 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is a lifecycle request
 	if hasQueryParam("lifecycle") {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.Lifecycle, "lifecycle") {
+			return
+		}
 		if r.Method == http.MethodPut {
 			handlePutLifecycle(w, r)
 			return
@@ -752,6 +813,9 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is a CORS request
 	if hasQueryParam("cors") {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.CORS, "cors") {
+			return
+		}
 		if r.Method == http.MethodPut {
 			handlePutCORS(w, r)
 			return
@@ -766,6 +830,9 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is a Logging request
 	if hasQueryParam("logging") {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.Logging, "logging") {
+			return
+		}
 		if r.Method == http.MethodPut {
 			handlePutLogging(w, r)
 			return
@@ -780,6 +847,9 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is a Website request
 	if hasQueryParam("website") {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.Website, "website") {
+			return
+		}
 		if r.Method == http.MethodPut {
 			handlePutWebsite(w, r)
 			return
@@ -794,6 +864,9 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is a Tagging request
 	if hasQueryParam("tagging") {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.Tagging, "tagging") {
+			return
+		}
 		if r.Method == http.MethodPut {
 			handlePutObjectTagging(w, r)
 			return
@@ -811,6 +884,9 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	// perform; we synthesise an S3-compatible success response so legacy
 	// clients that still call RestoreObject keep working without changes.
 	if hasQueryParam("restore") {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.RestoreObject, "restore_object") {
+			return
+		}
 		if r.Method == http.MethodPost {
 			handleRestoreObject(w, r)
 			return
@@ -820,6 +896,40 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, http.StatusNotImplemented, "NotImplemented",
 			"Only POST /<bucket>/<key>?restore is supported for the RestoreObject operation.")
 		return
+	}
+
+	// Data-plane composite gates (AGENTS rule 4 compatibility exception):
+	// reject high-cost operations when disabled so operators can lock the
+	// proxy down to basic CRUD without relying on IAM. Basic Get/Put/Head/
+	// Delete/List/ListBuckets intentionally have NO toggle — disabling them
+	// would break the proxy as a service and is better handled at the
+	// network / IAM layer.
+
+	// CopyObject: detected by the `x-amz-copy-source` header on a PUT.
+	// Covers both plain CopyObject and UploadPartCopy (whose PUT also
+	// carries x-amz-copy-source; the header, not the uploadId, is what
+	// triggers the server-side copy path on GCS).
+	if r.Method == http.MethodPut && r.Header.Get("x-amz-copy-source") != "" {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.CopyObject, "copy_object") {
+			return
+		}
+	}
+
+	// Multipart Upload family: CreateMultipartUpload (?uploads),
+	// UploadPart / UploadPartCopy (?partNumber&uploadId), Complete / Abort
+	// (?uploadId), ListMultipartUploads (?uploads on bucket).
+	if hasQueryParam("uploads") || hasQueryParam("uploadId") || hasQueryParam("partNumber") {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.MultipartUpload, "multipart_upload") {
+			return
+		}
+	}
+
+	// Bulk DeleteObjects: POST /<bucket>?delete. Distinct from single-object
+	// DELETE /<bucket>/<key>, which stays always-on.
+	if r.Method == http.MethodPost && hasQueryParam("delete") {
+		if !ensureFeatureEnabled(w, r, config.Config.Features.DeleteObjects, "delete_objects") {
+			return
+		}
 	}
 
 	// Default: Fallthrough to Reverse Proxy

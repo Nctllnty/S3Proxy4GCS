@@ -127,6 +127,18 @@ var (
 			Buckets: []float64{1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2},
 		},
 	)
+
+	// FeatureDisabledRejections counts requests refused because the targeted
+	// plane operation is turned off via `config.Features` (ENABLE_* env vars).
+	// Label cardinality is bounded by the fixed set of feature names defined
+	// in config.FeatureFlags — never bucket / object names.
+	FeatureDisabledRejections = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_feature_disabled_rejections_total",
+			Help: "Total number of requests rejected because the targeted feature is disabled via configuration.",
+		},
+		[]string{"feature"},
+	)
 )
 
 // ClassifyGCSError maps an HTTP status code to a low-cardinality status_class

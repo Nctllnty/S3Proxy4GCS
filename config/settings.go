@@ -2,12 +2,47 @@ package config
 
 import (
 	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/joho/godotenv"
 )
+
+// FeatureFlags gates every externally-visible operation exposed by the proxy.
+//
+// Every flag defaults to true so a zero-config upgrade from previous releases
+// continues to work. Disabling a control-plane or data-plane flag rejects the
+// matching requests with `501 NotImplemented` at handler dispatch (before any
+// body parsing or GCS call), and increments
+// `s3proxy_feature_disabled_rejections_total{feature=...}`.
+//
+// Health / Readyz / Metrics endpoints are registered only when their flag is
+// on; when disabled the proxy logs a startup WARN so operators are not
+// surprised by K8s probe or Prometheus scrape failures.
+type FeatureFlags struct {
+	// Control plane (XML-translating handlers)
+	Lifecycle     bool
+	CORS          bool
+	Logging       bool
+	Website       bool
+	Tagging       bool
+	RestoreObject bool
+
+	// Data plane — composite / high-cost operations only. Basic object CRUD
+	// (Get/Put/Head/Delete/List/ListBuckets) has no switch by design: turning
+	// them off would break the proxy as a whole and is better handled at the
+	// network or IAM layer.
+	CopyObject      bool
+	MultipartUpload bool
+	DeleteObjects   bool
+
+	// Ops plane (operational endpoints)
+	HealthEndpoint  bool
+	ReadyzEndpoint  bool
+	MetricsEndpoint bool
+}
 
 // Settings contains all the configuration for the proxy
 type Settings struct {
@@ -51,6 +86,9 @@ type Settings struct {
 	ReqLogMaxBackup int    // REQUEST_LOG_MAX_BACKUP,    default 5
 	ReqLogChanBuf   int    // REQUEST_LOG_CHAN_BUF,       default 10240
 	ReqLogKeepDays  int    // REQUEST_LOG_KEEP_DAYS,     default 7
+
+	// Features toggles every plane's operations on/off. See FeatureFlags doc.
+	Features FeatureFlags
 }
 
 var Config *Settings
@@ -168,6 +206,21 @@ func LoadConfig() {
 		}
 	}
 
+	features := FeatureFlags{
+		Lifecycle:       getEnvBool("ENABLE_LIFECYCLE", true),
+		CORS:            getEnvBool("ENABLE_CORS", true),
+		Logging:         getEnvBool("ENABLE_LOGGING", true),
+		Website:         getEnvBool("ENABLE_WEBSITE", true),
+		Tagging:         getEnvBool("ENABLE_TAGGING", true),
+		RestoreObject:   getEnvBool("ENABLE_RESTORE_OBJECT", true),
+		CopyObject:      getEnvBool("ENABLE_COPY_OBJECT", true),
+		MultipartUpload: getEnvBool("ENABLE_MULTIPART_UPLOAD", true),
+		DeleteObjects:   getEnvBool("ENABLE_DELETE_OBJECTS", true),
+		HealthEndpoint:  getEnvBool("ENABLE_HEALTH_ENDPOINT", true),
+		ReadyzEndpoint:  getEnvBool("ENABLE_READYZ_ENDPOINT", true),
+		MetricsEndpoint: getEnvBool("ENABLE_METRICS_ENDPOINT", true),
+	}
+
 	Config = &Settings{
 		Port:                      getEnv("PORT", "8080"),
 		GCPProjectID:              getEnv("GCP_PROJECT_ID", ""),
@@ -196,6 +249,7 @@ func LoadConfig() {
 		ReqLogMaxBackup:           reqLogMaxBackup,
 		ReqLogChanBuf:             reqLogChanBuf,
 		ReqLogKeepDays:            reqLogKeepDays,
+		Features:                  features,
 	}
 
 	// Validate required fields for non-DryRun mode
@@ -206,6 +260,58 @@ func LoadConfig() {
 		if Config.GCPProjectID == "" {
 			log.Println("WARNING: GCP_PROJECT_ID is empty, some GCS operations may fail")
 		}
+	}
+
+	logFeatureFlags(features)
+}
+
+// logFeatureFlags emits a single Info summary of every feature flag and an
+// extra Warn for each operational endpoint disabled, since those break K8s
+// probes and Prometheus scraping and are the most common mis-configuration.
+func logFeatureFlags(f FeatureFlags) {
+	slog.Info("Feature flags",
+		"lifecycle", f.Lifecycle,
+		"cors", f.CORS,
+		"logging", f.Logging,
+		"website", f.Website,
+		"tagging", f.Tagging,
+		"restore_object", f.RestoreObject,
+		"copy_object", f.CopyObject,
+		"multipart_upload", f.MultipartUpload,
+		"delete_objects", f.DeleteObjects,
+		"health_endpoint", f.HealthEndpoint,
+		"readyz_endpoint", f.ReadyzEndpoint,
+		"metrics_endpoint", f.MetricsEndpoint,
+	)
+	if !f.HealthEndpoint {
+		slog.Warn("/health endpoint DISABLED — Kubernetes liveness probes will fail")
+	}
+	if !f.ReadyzEndpoint {
+		slog.Warn("/readyz endpoint DISABLED — Kubernetes readiness probes will fail")
+	}
+	if !f.MetricsEndpoint {
+		slog.Warn("/metrics endpoint DISABLED — Prometheus scraping will fail")
+	}
+}
+
+// getEnvBool parses boolean env vars with a configurable default. Only the
+// literal string "false" (case-insensitive) flips a default-true flag off;
+// any other non-empty value keeps it true to protect against typos like
+// "0" / "no" / " false " that would silently disable critical features.
+// For default-false flags the inverse applies.
+func getEnvBool(key string, fallback bool) bool {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+	switch raw {
+	case "true", "TRUE", "True", "1":
+		return true
+	case "false", "FALSE", "False", "0":
+		return false
+	default:
+		log.Printf("WARNING: invalid boolean for %s=%q, using default %v", key, raw, fallback)
+		return fallback
 	}
 }
 

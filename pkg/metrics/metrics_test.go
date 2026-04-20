@@ -3,6 +3,8 @@ package metrics
 import (
 	"net/http"
 	"testing"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 // TestClassifyEndpoint guards the low-cardinality endpoint labels emitted
@@ -44,4 +46,36 @@ func TestClassifyEndpoint(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFeatureDisabledRejectionsCounter checks that the counter added in
+// v1.6 is registered, accepts the expected label, and increments as a
+// normal Prometheus counter. This is a tiny smoke test; the feature-gate
+// branches in main.go own the behavioural coverage.
+func TestFeatureDisabledRejectionsCounter(t *testing.T) {
+	// Each distinct label is a separate series. Using a test-only label
+	// keeps this assertion independent of other tests running in the same
+	// process that may touch the production labels.
+	const feature = "unit_test_sentinel"
+
+	before := readCounter(t, feature)
+	FeatureDisabledRejections.WithLabelValues(feature).Inc()
+	FeatureDisabledRejections.WithLabelValues(feature).Inc()
+	after := readCounter(t, feature)
+
+	if got := after - before; got != 2 {
+		t.Errorf("counter delta = %v, want 2", got)
+	}
+}
+
+func readCounter(t *testing.T, feature string) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	if err := FeatureDisabledRejections.WithLabelValues(feature).Write(m); err != nil {
+		t.Fatalf("write metric: %v", err)
+	}
+	if m.Counter == nil || m.Counter.Value == nil {
+		return 0
+	}
+	return *m.Counter.Value
 }

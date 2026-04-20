@@ -36,6 +36,29 @@ Available Configuration Options:
 -   `PPROF_ADDR` (Default: empty / disabled): Bind address for the optional `net/http/pprof` profiling endpoint (e.g. `127.0.0.1:6060`). Uses a dedicated listener so runtime profiles never compete with or leak through the main data-plane port. Enable only for diagnostics.
 -   `RESTORE_SKIP_EXISTENCE_CHECK` (Default: `false`): Controls the GCS HEAD probe in the synthetic `RestoreObject` shim (see [Compatibility Shims](#compatibility-shims)). Leave at `false` so missing keys return `404 NoSuchKey`; set to `true` to save one Class B GCS call per `RestoreObject` when callers can tolerate deferred 404 discovery on the next `GetObject`.
 
+#### Feature Flags (v1.6+)
+
+Every control-plane, data-plane-composite and operational-plane surface can be individually disabled. All flags default to `true`, so zero-config upgrades retain every pre-v1.6 behaviour. When disabled, S3 operations return `501 NotImplemented` and operational endpoints return `404`; either way `s3proxy_feature_disabled_rejections_total{feature=...}` is incremented.
+
+| Variable | Default | Scope |
+|---|---|---|
+| `ENABLE_LIFECYCLE` | `true` | Control plane: `PUT/GET/DELETE /?lifecycle` |
+| `ENABLE_CORS` | `true` | Control plane: `PUT/GET/DELETE /?cors` |
+| `ENABLE_LOGGING` | `true` | Control plane: `PUT/GET/DELETE /?logging` |
+| `ENABLE_WEBSITE` | `true` | Control plane: `PUT/GET/DELETE /?website` |
+| `ENABLE_TAGGING` | `true` | Control plane: `PUT/GET/DELETE /<bucket>/<key>?tagging` |
+| `ENABLE_RESTORE_OBJECT` | `true` | Control plane (shim): `POST /<bucket>/<key>?restore` |
+| `ENABLE_COPY_OBJECT` | `true` | Data plane: any `PUT` carrying `x-amz-copy-source` (covers `CopyObject` + `UploadPartCopy`) |
+| `ENABLE_MULTIPART_UPLOAD` | `true` | Data plane: any request with `?uploads`, `?uploadId`, or `?partNumber` |
+| `ENABLE_DELETE_OBJECTS` | `true` | Data plane: `POST /<bucket>?delete` (bulk) |
+| `ENABLE_HEALTH_ENDPOINT` | `true` | Ops: `GET /health` — **turning off breaks K8s liveness probes** |
+| `ENABLE_READYZ_ENDPOINT` | `true` | Ops: `GET /readyz` — **turning off breaks K8s readiness probes** |
+| `ENABLE_METRICS_ENDPOINT` | `true` | Ops: `GET /metrics` — **turning off breaks Prometheus scraping** |
+
+Basic object CRUD (`GetObject`, `PutObject`, `HeadObject`, single-object `DeleteObject`, `ListObjects`, `ListBuckets`) has **no flag by design**: disabling it would make the proxy useless as a service. Use network policy or IAM to restrict those operations.
+
+Accepted boolean strings: `true` / `false` / `1` / `0` (case-insensitive). Any other value is logged as a WARN at startup and falls back to the default — typos cannot silently disable critical features. The startup log always contains a single-line `Feature flags` summary of all 12 values; any disabled ops endpoint produces an extra WARN line.
+
 ## Alternative: Transparent Routing via HTTP_PROXY
 
 > **Note**: The recommended approach is direct endpoint configuration (see [Per-SDK Client Configuration](#per-sdk-client-configuration) below). This section documents an alternative approach using system proxy environment variables.

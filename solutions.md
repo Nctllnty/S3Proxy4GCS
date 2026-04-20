@@ -287,6 +287,18 @@ Health probes, metrics, logging infrastructure, and operational safeguards.
 | **Graceful Shutdown** | ✅ Implemented | SIGTERM/SIGINT with 10s drain |
 | **DryRun Mode** | ✅ Implemented | Local dev without real GCS hits |
 
+### Three-plane Feature Gating (v1.6+)
+
+Every control-plane resource family, every high-cost data-plane composite
+operation (`CopyObject`, Multipart, bulk `DeleteObjects`) and every
+operational endpoint (`/health`, `/readyz`, `/metrics`) can be individually
+turned off via an `ENABLE_*` env var. Flags default to `true`, so upgrades
+preserve behaviour. Rejections return `501 NotImplemented` (for S3
+surfaces) or `404` (for ops endpoints) and are counted by
+`s3proxy_feature_disabled_rejections_total{feature=...}`. Basic
+object CRUD has no flag by design — lock it down at the network / IAM
+layer if required. See `README.md § Feature Flags` for the full matrix.
+
 ### Quality Assurance & CI/CD
 
 | Layer | Status | Scope |
