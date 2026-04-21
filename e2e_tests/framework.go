@@ -129,9 +129,17 @@ func NewDirectGCSClient(t *testing.T, env *Env) *s3.Client {
 		}, nil
 	})
 
+	// GCS S3-compatible API requires the SigV4 signing region to match
+	// the bucket's actual GCS location. Using "auto" is the universal
+	// fallback accepted by GCS for any bucket location.
+	gcsRegion := os.Getenv("GCS_REGION")
+	if gcsRegion == "" {
+		gcsRegion = "auto"
+	}
+
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithCredentialsProvider(creds),
-		config.WithRegion("us-east-1"),
+		config.WithRegion(gcsRegion),
 		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	)
