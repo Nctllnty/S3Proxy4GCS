@@ -42,6 +42,7 @@ type Record struct {
 	HTTPMethod  string
 	APIMethod   string
 	Bucket      string
+	AccessKey   string
 	StatusCode  int
 	DurationMs  int64
 }
@@ -55,6 +56,7 @@ func (rec Record) ToCSVLine() string {
 		rec.HTTPMethod,
 		rec.APIMethod,
 		rec.Bucket,
+		rec.AccessKey,
 		strconv.Itoa(rec.StatusCode),
 		strconv.FormatInt(rec.DurationMs, 10),
 	}, "\u0001")
@@ -103,6 +105,7 @@ func Middleware(logger *ymlog.Logger) func(http.Handler) http.Handler {
 				HTTPMethod:  r.Method,
 				APIMethod:   InferAPIMethod(r),
 				Bucket:      ExtractBucket(r),
+				AccessKey:   ExtractAccessKey(r),
 				StatusCode:  rec.status,
 				DurationMs:  time.Since(start).Milliseconds(),
 			}
@@ -244,6 +247,47 @@ func ExtractBucket(r *http.Request) string {
 	}
 	parts := strings.SplitN(trimmed, "/", 2)
 	return parts[0]
+}
+
+// credentialRe matches the Access Key ID inside SigV4 "Credential=AK/date/region/service/aws4_request".
+// It tolerates optional whitespace after "Credential=" and stops at the first "/".
+var credentialRe = regexp.MustCompile(`Credential=\s*([^/,\s]+)/`)
+
+// ExtractAccessKey returns the Access Key ID used to sign the request.
+//
+// Supported signing schemes:
+//   - AWS Signature V4 via Authorization header:
+//     "AWS4-HMAC-SHA256 Credential=AKID/YYYYMMDD/region/s3/aws4_request, SignedHeaders=..., Signature=..."
+//   - AWS Signature V4 via presigned URL query:
+//     ?X-Amz-Credential=AKID%2FYYYYMMDD%2Fregion%2Fs3%2Faws4_request
+//   - AWS Signature V2 via Authorization header:
+//     "AWS AKID:signature"
+//
+// Returns "" if no recognizable Access Key ID is found (e.g. anonymous requests).
+func ExtractAccessKey(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if m := credentialRe.FindStringSubmatch(auth); len(m) == 2 {
+			return m[1]
+		}
+		// Signature V2: "AWS AKID:signature"
+		if rest, ok := strings.CutPrefix(auth, "AWS "); ok {
+			if i := strings.IndexByte(rest, ':'); i > 0 {
+				return strings.TrimSpace(rest[:i])
+			}
+		}
+	}
+	// Presigned URL (SigV4). URL.Query() already percent-decodes the value,
+	// so the raw form "AKID/date/region/service/aws4_request" is restored.
+	if cred := r.URL.Query().Get("X-Amz-Credential"); cred != "" {
+		if i := strings.IndexByte(cred, '/'); i > 0 {
+			return cred[:i]
+		}
+	}
+	// Presigned URL (SigV2).
+	if ak := r.URL.Query().Get("AWSAccessKeyId"); ak != "" {
+		return ak
+	}
+	return ""
 }
 
 // StartCleanup launches a background goroutine that runs once daily at 00:05,
