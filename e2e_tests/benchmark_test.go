@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -588,20 +589,25 @@ func statsMBs(s Stats) string {
 }
 
 // ---------------------------------------------------------------------------
-// Direct GCS S3-compatible API Benchmark (same SDK, no proxy)
+// Direct GCS Benchmark (native GCS Go SDK, no proxy)
 // ---------------------------------------------------------------------------
 
-// TestDirectGCSBenchmark runs the same PutObject/GetObject benchmarks but
-// directly against the GCS S3-compatible API (storage.googleapis.com).
-// This uses the exact same AWS SDK Go v2, HMAC credentials, and HTTP transport
-// as the proxy benchmark, ensuring the ONLY variable is "with/without proxy".
+// TestDirectGCSBenchmark runs PutObject/GetObject benchmarks directly against
+// GCS using the native Google Cloud Storage Go SDK. This eliminates all S3
+// protocol/signing compatibility concerns and provides a clean GCS baseline.
 func TestDirectGCSBenchmark(t *testing.T) {
 	if os.Getenv("BENCH_MODE") != "direct" {
 		t.Skip("Skipping direct GCS benchmark (set BENCH_MODE=direct to enable)")
 	}
 
-	client := NewDirectGCSClient(t, testEnv)
-	bucket := testEnv.TestBucket
+	ctx := context.Background()
+	gcsClient, err := storage.NewClient(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create GCS client: %v", err)
+	}
+	defer gcsClient.Close()
+
+	bucketName := testEnv.TestBucket
 	concurrency := getBenchConcurrency()
 	durationSec := getBenchDurationSec()
 	duration := time.Duration(durationSec) * time.Second
@@ -613,7 +619,7 @@ func TestDirectGCSBenchmark(t *testing.T) {
 
 	report := BenchmarkReport{
 		Timestamp:     time.Now().UTC().Format(time.RFC3339),
-		ProxyEndpoint: "https://storage.googleapis.com (direct)",
+		ProxyEndpoint: "GCS native SDK (direct)",
 		ProxyNodePool: nodePool,
 		Config: BenchmarkConfig{
 			Concurrency: concurrency,
@@ -621,15 +627,15 @@ func TestDirectGCSBenchmark(t *testing.T) {
 		},
 	}
 
-	t.Logf("Direct GCS Benchmark: concurrency=%d, duration=%ds, node_pool=%s", concurrency, durationSec, nodePool)
+	t.Logf("Direct GCS Benchmark (native SDK): concurrency=%d, duration=%ds, node_pool=%s", concurrency, durationSec, nodePool)
 	t.Log("")
 
 	// =======================================================================
-	// 1. Multi-tier PutObject (direct to GCS)
+	// 1. Multi-tier Upload (direct to GCS)
 	// =======================================================================
 	for _, tier := range payloadTiers {
-		t.Logf("=== Direct PutObject %s (%d concurrent, %ds) ===", tier.Name, concurrency, durationSec)
-		payload := makePayload(tier.Size)
+		t.Logf("=== Direct Upload %s (%d concurrent, %ds) ===", tier.Name, concurrency, durationSec)
+		payload := []byte(makePayload(tier.Size))
 
 		var putKeysMu sync.Mutex
 		var putKeys []string
@@ -637,17 +643,18 @@ func TestDirectGCSBenchmark(t *testing.T) {
 		start := time.Now()
 		lr := runConcurrentLoad(concurrency, duration, func() error {
 			key := fmt.Sprintf("%sdirect-bench-put-%s-%d", testEnv.TestPrefix, tier.Name, time.Now().UnixNano())
-			_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
-				Bucket: aws.String(bucket),
-				Key:    aws.String(key),
-				Body:   strings.NewReader(payload),
-			})
-			if err == nil {
-				putKeysMu.Lock()
-				putKeys = append(putKeys, key)
-				putKeysMu.Unlock()
+			w := gcsClient.Bucket(bucketName).Object(key).NewWriter(ctx)
+			if _, err := w.Write(payload); err != nil {
+				w.Close()
+				return err
 			}
-			return err
+			if err := w.Close(); err != nil {
+				return err
+			}
+			putKeysMu.Lock()
+			putKeys = append(putKeys, key)
+			putKeysMu.Unlock()
+			return nil
 		})
 		wallClock := time.Since(start)
 
@@ -655,41 +662,43 @@ func TestDirectGCSBenchmark(t *testing.T) {
 		report.Results = append(report.Results, result)
 		printBenchResult(t, result)
 
+		// Cleanup
 		t.Logf("  Cleaning up %d objects...", len(putKeys))
-		cleanupPutKeys(client, bucket, putKeys, concurrency)
+		for _, k := range putKeys {
+			gcsClient.Bucket(bucketName).Object(k).Delete(ctx)
+		}
 		t.Logf("  Cleanup done.")
 	}
 
 	// =======================================================================
-	// 2. Multi-tier GetObject (direct from GCS)
+	// 2. Multi-tier Download (direct from GCS)
 	// =======================================================================
 	for _, tier := range payloadTiers {
-		t.Logf("=== Direct GetObject %s (%d concurrent, %ds) ===", tier.Name, concurrency, durationSec)
+		t.Logf("=== Direct Download %s (%d concurrent, %ds) ===", tier.Name, concurrency, durationSec)
 
 		seedKey := fmt.Sprintf("%sdirect-bench-get-seed-%s", testEnv.TestPrefix, tier.Name)
-		payload := makePayload(tier.Size)
-		_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(seedKey),
-			Body:   strings.NewReader(payload),
-		})
-		if err != nil {
+		payload := []byte(makePayload(tier.Size))
+
+		w := gcsClient.Bucket(bucketName).Object(seedKey).NewWriter(ctx)
+		if _, err := w.Write(payload); err != nil {
+			w.Close()
 			t.Logf("  [skip] Failed to seed object for DirectGet %s: %v", tier.Name, err)
 			continue
 		}
-		t.Cleanup(func() { Cleanup(t, client, bucket, seedKey) })
+		if err := w.Close(); err != nil {
+			t.Logf("  [skip] Failed to seed object for DirectGet %s: %v", tier.Name, err)
+			continue
+		}
+		t.Cleanup(func() { gcsClient.Bucket(bucketName).Object(seedKey).Delete(ctx) })
 
 		start := time.Now()
 		lr := runConcurrentLoad(concurrency, duration, func() error {
-			out, err := client.GetObject(context.TODO(), &s3.GetObjectInput{
-				Bucket: aws.String(bucket),
-				Key:    aws.String(seedKey),
-			})
+			r, err := gcsClient.Bucket(bucketName).Object(seedKey).NewReader(ctx)
 			if err != nil {
 				return err
 			}
-			io.Copy(io.Discard, out.Body)
-			out.Body.Close()
+			io.Copy(io.Discard, r)
+			r.Close()
 			return nil
 		})
 		wallClock := time.Since(start)
@@ -721,7 +730,7 @@ func TestDirectGCSBenchmark(t *testing.T) {
 	// Summary table
 	fmt.Println()
 	fmt.Println("================================================================================")
-	fmt.Println("  Direct GCS S3-Compatible API Benchmark Summary")
+	fmt.Println("  Direct GCS Native SDK Benchmark Summary")
 	fmt.Printf("  Concurrency: %d | Duration per test: %ds | Node Pool: %s\n", concurrency, durationSec, nodePool)
 	fmt.Println("================================================================================")
 	fmt.Printf("  %-25s %6s %6s %8s %8s %8s %8s %8s %6s\n",

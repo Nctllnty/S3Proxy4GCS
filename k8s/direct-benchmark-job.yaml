@@ -1,6 +1,6 @@
-# Direct GCS S3-Compatible API Benchmark Job.
-# Runs the same AWS SDK Go v2 benchmark directly against storage.googleapis.com,
-# bypassing the S3Proxy, to establish a true apples-to-apples baseline.
+# Direct GCS Native SDK Benchmark Job.
+# Uses the native Google Cloud Storage Go SDK directly against GCS,
+# bypassing the S3Proxy entirely. Auth via GKE Workload Identity.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -29,19 +29,9 @@ spec:
             - "-test.timeout=45m"
             - "-test.run=TestDirectGCSBenchmark"
           env:
-            # BENCH_MODE=direct: skip proxy health check, use GCS S3-compatible API
+            # BENCH_MODE=direct: skip proxy health check, use native GCS SDK
             - name: BENCH_MODE
               value: "direct"
-            - name: GCS_HMAC_ACCESS
-              valueFrom:
-                secretKeyRef:
-                  name: s3proxy-credentials
-                  key: PROXY_AWS_ACCESS_KEY_ID
-            - name: GCS_HMAC_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: s3proxy-credentials
-                  key: PROXY_AWS_SECRET_ACCESS_KEY
             - name: TEST_BUCKET
               valueFrom:
                 secretKeyRef:

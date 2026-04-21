@@ -18,17 +18,15 @@ func TestMain(m *testing.M) {
 	env, err := LoadEnv()
 	if err != nil {
 		if directMode {
-			// In direct mode, PROXY_ENDPOINT is not required;
-			// only HMAC + bucket are needed.
+			// In direct mode, only TEST_BUCKET is required;
+			// GCS native SDK uses Workload Identity for auth.
 			env = &Env{
-				ProxyEndpoint: "https://storage.googleapis.com",
-				HMACAccess:    os.Getenv("GCS_HMAC_ACCESS"),
-				HMACSecret:    os.Getenv("GCS_HMAC_SECRET"),
+				ProxyEndpoint: "direct-gcs-native-sdk",
 				TestBucket:    os.Getenv("TEST_BUCKET"),
 				TestPrefix:    os.Getenv("TEST_PREFIX"),
 			}
-			if env.HMACAccess == "" || env.HMACSecret == "" || env.TestBucket == "" {
-				log.Fatalf("Direct mode requires GCS_HMAC_ACCESS, GCS_HMAC_SECRET, TEST_BUCKET")
+			if env.TestBucket == "" {
+				log.Fatalf("Direct mode requires TEST_BUCKET")
 			}
 		} else {
 			log.Fatalf("E2E Environment setup failed: %v", err)

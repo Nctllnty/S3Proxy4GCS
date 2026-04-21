@@ -114,54 +114,6 @@ func GenerateTestKey(env *Env, suffix string) string {
 	return fmt.Sprintf("%s%s-%d", env.TestPrefix, suffix, ts)
 }
 
-// NewDirectGCSClient creates an AWS S3 client configured to connect directly
-// to the GCS S3-compatible API (storage.googleapis.com), bypassing the proxy.
-// Uses the same HMAC credentials and HTTP transport settings as NewS3Client
-// so the only variable is "with proxy" vs "without proxy".
-func NewDirectGCSClient(t *testing.T, env *Env) *s3.Client {
-	t.Helper()
-
-	creds := aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
-		return aws.Credentials{
-			AccessKeyID:     env.HMACAccess,
-			SecretAccessKey: env.HMACSecret,
-			Source:          "e2e-direct-gcs",
-		}, nil
-	})
-
-	// GCS S3-compatible API requires the SigV4 signing region to match
-	// the bucket's actual GCS location. Using "auto" is the universal
-	// fallback accepted by GCS for any bucket location.
-	gcsRegion := os.Getenv("GCS_REGION")
-	if gcsRegion == "" {
-		gcsRegion = "auto"
-	}
-
-	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithCredentialsProvider(creds),
-		config.WithRegion(gcsRegion),
-		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
-		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
-	)
-	if err != nil {
-		t.Fatalf("Failed to load AWS config: %v", err)
-	}
-
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-		o.BaseEndpoint = aws.String("https://storage.googleapis.com")
-		o.HTTPClient = &http.Client{
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
-			Timeout: 60 * time.Second,
-		}
-	})
-
-	return client
-}
 
 // Cleanup deletes the given object keys from the bucket, ignoring errors.
 // Intended to be called in a defer or t.Cleanup.
