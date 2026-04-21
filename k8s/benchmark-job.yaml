@@ -35,7 +35,7 @@ spec:
           args:
             - "-test.v"
             - "-test.count=1"
-            - "-test.timeout=20m"
+            - "-test.timeout=45m"
             - "-test.run=TestBenchmarkSuite"
           env:
             # Reach S3Proxy through ClusterIP Service (port 80 -> targetPort 8080)

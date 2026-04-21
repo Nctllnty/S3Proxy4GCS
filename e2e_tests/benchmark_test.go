@@ -118,16 +118,32 @@ type loadResult struct {
 	errors    int64
 }
 
-// cleanupPutKeys deletes the given keys in parallel (best-effort, no error
-// propagation).  This runs AFTER the benchmark measurement is complete so
-// the DELETE traffic does not interfere with PutObject throughput numbers.
+// cleanupPutKeys uses S3 bulk DeleteObjects (up to 1000 keys per batch)
+// with parallel batch workers. This is ~100x faster than individual deletes
+// for high-concurrency tests that produce 50K-100K+ objects.
 func cleanupPutKeys(client *s3.Client, bucket string, keys []string, workers int) {
 	if len(keys) == 0 {
 		return
 	}
-	ch := make(chan string, len(keys))
-	for _, k := range keys {
-		ch <- k
+	const batchSize = 1000
+
+	// Build batches
+	var batches [][]types.ObjectIdentifier
+	for i := 0; i < len(keys); i += batchSize {
+		end := i + batchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := make([]types.ObjectIdentifier, 0, end-i)
+		for _, k := range keys[i:end] {
+			batch = append(batch, types.ObjectIdentifier{Key: aws.String(k)})
+		}
+		batches = append(batches, batch)
+	}
+
+	ch := make(chan []types.ObjectIdentifier, len(batches))
+	for _, b := range batches {
+		ch <- b
 	}
 	close(ch)
 
@@ -136,10 +152,13 @@ func cleanupPutKeys(client *s3.Client, bucket string, keys []string, workers int
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for key := range ch {
-				client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+			for batch := range ch {
+				client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
 					Bucket: aws.String(bucket),
-					Key:    aws.String(key),
+					Delete: &types.Delete{
+						Objects: batch,
+						Quiet:   aws.Bool(true),
+					},
 				})
 			}
 		}()

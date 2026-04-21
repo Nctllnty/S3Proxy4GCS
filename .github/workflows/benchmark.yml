@@ -158,11 +158,11 @@ jobs:
 
       - name: Wait for Benchmark Completion
         run: |
-          # Wait for job to complete (max 20 minutes).
+          # Wait for job to complete (max 45 minutes).
           # K8s 1.35+ uses JobSuccessPolicy which first sets SuccessCriteriaMet
           # before promoting to Complete, so accept either as success.
           kubectl wait --for=condition=complete job/benchmark \
-            -n ${{ env.K8S_NAMESPACE }} --timeout=1200s || true
+            -n ${{ env.K8S_NAMESPACE }} --timeout=2700s || true
 
           # Check job status: look for either Complete or SuccessCriteriaMet
           STATUS=$(kubectl get job benchmark -n ${{ env.K8S_NAMESPACE }} \
