@@ -587,6 +587,153 @@ func statsMBs(s Stats) string {
 	return fmt.Sprintf("%.2f/%.2f", s.Max/(1024*1024), s.Avg/(1024*1024))
 }
 
+// ---------------------------------------------------------------------------
+// Direct GCS S3-compatible API Benchmark (same SDK, no proxy)
+// ---------------------------------------------------------------------------
+
+// TestDirectGCSBenchmark runs the same PutObject/GetObject benchmarks but
+// directly against the GCS S3-compatible API (storage.googleapis.com).
+// This uses the exact same AWS SDK Go v2, HMAC credentials, and HTTP transport
+// as the proxy benchmark, ensuring the ONLY variable is "with/without proxy".
+func TestDirectGCSBenchmark(t *testing.T) {
+	if os.Getenv("BENCH_MODE") != "direct" {
+		t.Skip("Skipping direct GCS benchmark (set BENCH_MODE=direct to enable)")
+	}
+
+	client := NewDirectGCSClient(t, testEnv)
+	bucket := testEnv.TestBucket
+	concurrency := getBenchConcurrency()
+	durationSec := getBenchDurationSec()
+	duration := time.Duration(durationSec) * time.Second
+
+	nodePool := os.Getenv("BENCHMARK_NODE_POOL")
+	if nodePool == "" {
+		nodePool = "unknown"
+	}
+
+	report := BenchmarkReport{
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+		ProxyEndpoint: "https://storage.googleapis.com (direct)",
+		ProxyNodePool: nodePool,
+		Config: BenchmarkConfig{
+			Concurrency: concurrency,
+			DurationSec: durationSec,
+		},
+	}
+
+	t.Logf("Direct GCS Benchmark: concurrency=%d, duration=%ds, node_pool=%s", concurrency, durationSec, nodePool)
+	t.Log("")
+
+	// =======================================================================
+	// 1. Multi-tier PutObject (direct to GCS)
+	// =======================================================================
+	for _, tier := range payloadTiers {
+		t.Logf("=== Direct PutObject %s (%d concurrent, %ds) ===", tier.Name, concurrency, durationSec)
+		payload := makePayload(tier.Size)
+
+		var putKeysMu sync.Mutex
+		var putKeys []string
+
+		start := time.Now()
+		lr := runConcurrentLoad(concurrency, duration, func() error {
+			key := fmt.Sprintf("%sdirect-bench-put-%s-%d", testEnv.TestPrefix, tier.Name, time.Now().UnixNano())
+			_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+				Body:   strings.NewReader(payload),
+			})
+			if err == nil {
+				putKeysMu.Lock()
+				putKeys = append(putKeys, key)
+				putKeysMu.Unlock()
+			}
+			return err
+		})
+		wallClock := time.Since(start)
+
+		result := toBenchmarkResult("DirectPut_"+tier.Name, tier.Name, concurrency, lr, wallClock, SystemDelta{}, PodMetrics{})
+		report.Results = append(report.Results, result)
+		printBenchResult(t, result)
+
+		t.Logf("  Cleaning up %d objects...", len(putKeys))
+		cleanupPutKeys(client, bucket, putKeys, concurrency)
+		t.Logf("  Cleanup done.")
+	}
+
+	// =======================================================================
+	// 2. Multi-tier GetObject (direct from GCS)
+	// =======================================================================
+	for _, tier := range payloadTiers {
+		t.Logf("=== Direct GetObject %s (%d concurrent, %ds) ===", tier.Name, concurrency, durationSec)
+
+		seedKey := fmt.Sprintf("%sdirect-bench-get-seed-%s", testEnv.TestPrefix, tier.Name)
+		payload := makePayload(tier.Size)
+		_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(seedKey),
+			Body:   strings.NewReader(payload),
+		})
+		if err != nil {
+			t.Logf("  [skip] Failed to seed object for DirectGet %s: %v", tier.Name, err)
+			continue
+		}
+		t.Cleanup(func() { Cleanup(t, client, bucket, seedKey) })
+
+		start := time.Now()
+		lr := runConcurrentLoad(concurrency, duration, func() error {
+			out, err := client.GetObject(context.TODO(), &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(seedKey),
+			})
+			if err != nil {
+				return err
+			}
+			io.Copy(io.Discard, out.Body)
+			out.Body.Close()
+			return nil
+		})
+		wallClock := time.Since(start)
+
+		result := toBenchmarkResult("DirectGet_"+tier.Name, tier.Name, concurrency, lr, wallClock, SystemDelta{}, PodMetrics{})
+		report.Results = append(report.Results, result)
+		printBenchResult(t, result)
+	}
+
+	// =======================================================================
+	// 3. Write JSON report
+	// =======================================================================
+	reportJSON, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		t.Fatalf("Failed to marshal direct benchmark report: %v", err)
+	}
+
+	reportPath := "benchmark_report.json"
+	if err := os.WriteFile(reportPath, reportJSON, 0644); err != nil {
+		t.Logf("Warning: failed to write report to %s: %v", reportPath, err)
+	} else {
+		t.Logf("Direct benchmark report written to %s", reportPath)
+	}
+
+	fmt.Println("BENCHMARK_JSON_START")
+	fmt.Println(string(reportJSON))
+	fmt.Println("BENCHMARK_JSON_END")
+
+	// Summary table
+	fmt.Println()
+	fmt.Println("================================================================================")
+	fmt.Println("  Direct GCS S3-Compatible API Benchmark Summary")
+	fmt.Printf("  Concurrency: %d | Duration per test: %ds | Node Pool: %s\n", concurrency, durationSec, nodePool)
+	fmt.Println("================================================================================")
+	fmt.Printf("  %-25s %6s %6s %8s %8s %8s %8s %8s %6s\n",
+		"Name", "Size", "Ops", "ops/s", "p50(ms)", "p95(ms)", "p99(ms)", "max(ms)", "Errs")
+	fmt.Println("  " + strings.Repeat("-", 94))
+	for _, r := range report.Results {
+		fmt.Printf("  %-25s %6s %6d %8.1f %8.1f %8.1f %8.1f %8.1f %6d\n",
+			r.Name, r.PayloadSize, r.TotalOps, r.OpsPerSec, r.P50Ms, r.P95Ms, r.P99Ms, r.MaxMs, r.Errors)
+	}
+	fmt.Println("================================================================================")
+}
+
 func printBenchResult(t *testing.T, r BenchmarkResult) {
 	t.Logf("  ops=%d  ops/s=%.1f  p50=%.1fms  p95=%.1fms  p99=%.1fms  max=%.1fms  errors=%d",
 		r.TotalOps, r.OpsPerSec, r.P50Ms, r.P95Ms, r.P99Ms, r.MaxMs, r.Errors)

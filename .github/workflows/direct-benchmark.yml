@@ -1,0 +1,198 @@
+name: Direct GCS Baseline Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: 'Number of concurrent goroutines'
+        required: false
+        default: '10'
+        type: string
+      duration_sec:
+        description: 'Duration per benchmark in seconds'
+        required: false
+        default: '30'
+        type: string
+
+env:
+  GKE_CLUSTER: s3proxy-e2e
+  GKE_REGION: us-east1
+  GAR_REGISTRY: us-east1-docker.pkg.dev/cbs-poctest/s3proxy
+  K8S_NAMESPACE: s3proxy-e2e
+
+# Share the same concurrency group as proxy benchmark to avoid conflicts
+# on shared K8s secrets and benchmark node pool.
+concurrency:
+  group: benchmark-exclusive
+  cancel-in-progress: false
+
+jobs:
+  direct-benchmark:
+    name: Build & Direct GCS Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      # ---- GCP Auth ----
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-east1-docker.pkg.dev --quiet
+
+      # ---- Multi-arch Build Setup ----
+      - name: Set up QEMU (for arm64 cross-build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ---- Build & Push Benchmark Image (multi-arch) ----
+      # NOTE: No S3Proxy image build needed — direct benchmark bypasses the proxy.
+      - name: Build and Push Benchmark Image
+        run: |
+          IMAGE="${{ env.GAR_REGISTRY }}/s3proxy-benchmark:${{ steps.meta.outputs.tag }}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag "$IMAGE" \
+            --file e2e_tests/Dockerfile \
+            --push e2e_tests/
+
+      # ---- Connect to GKE ----
+      - name: Get GKE Credentials
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+            --region ${{ env.GKE_REGION }} --project cbs-poctest
+
+      # ---- Ensure secrets exist (shared with proxy benchmark) ----
+      - name: Ensure K8s Secrets
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl create secret generic s3proxy-credentials \
+            --from-literal=PROXY_AWS_ACCESS_KEY_ID=${{ secrets.GCS_HMAC_ACCESS }} \
+            --from-literal=PROXY_AWS_SECRET_ACCESS_KEY=${{ secrets.GCS_HMAC_SECRET }} \
+            -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic s3proxy-config \
+            --from-literal=TARGET_BUCKET=${{ secrets.TEST_BUCKET }} \
+            -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      # ---- Run Direct Benchmark as K8s Job ----
+      # No proxy deployment — Pod connects directly to storage.googleapis.com
+      - name: Run Direct Benchmark Job
+        run: |
+          BENCH_IMAGE="${{ env.GAR_REGISTRY }}/s3proxy-benchmark:${{ steps.meta.outputs.tag }}"
+
+          # Delete any previous direct-benchmark job
+          kubectl delete job direct-benchmark -n ${{ env.K8S_NAMESPACE }} --ignore-not-found
+          sleep 2
+
+          # Apply the job manifest with correct image and parameters
+          sed -e "s|image: .*s3proxy-benchmark:.*|image: ${BENCH_IMAGE}|" \
+              -e "s|value: \"10\"|value: \"${{ inputs.concurrency }}\"|" \
+              -e 's|value: "direct-bench/"|value: "direct-bench-${{ github.run_id }}/"|' \
+              k8s/direct-benchmark-job.yaml | \
+            sed "/BENCH_DURATION_SEC/{n;s|value: \"30\"|value: \"${{ inputs.duration_sec }}\"|;}" | \
+            kubectl apply -f -
+
+          echo "Direct benchmark job started. Waiting for completion..."
+
+      - name: Wait for Direct Benchmark Completion
+        run: |
+          kubectl wait --for=condition=complete job/direct-benchmark \
+            -n ${{ env.K8S_NAMESPACE }} --timeout=2700s || true
+
+          STATUS=$(kubectl get job direct-benchmark -n ${{ env.K8S_NAMESPACE }} \
+            -o jsonpath='{range .status.conditions[*]}{.type}{"\n"}{end}' \
+            | grep -E '^(Complete|SuccessCriteriaMet|Failed)$' | head -1)
+          echo "Job status: $STATUS"
+
+          if [ "$STATUS" != "Complete" ] && [ "$STATUS" != "SuccessCriteriaMet" ]; then
+            echo "::error::Direct benchmark job did not complete successfully (status: $STATUS)"
+            kubectl logs job/direct-benchmark -n ${{ env.K8S_NAMESPACE }} --tail=50
+            exit 1
+          fi
+          echo "Direct benchmark job completed (status: $STATUS)"
+
+      # ---- Collect Results ----
+      - name: Collect Benchmark Results
+        if: always()
+        run: |
+          mkdir -p results
+
+          kubectl logs job/direct-benchmark -n ${{ env.K8S_NAMESPACE }} > results/benchmark_output.txt 2>&1 || true
+
+          python3 << 'PYEOF'
+          import sys
+          text = open('results/benchmark_output.txt').read()
+          start_marker = 'BENCHMARK_JSON_START'
+          end_marker = 'BENCHMARK_JSON_END'
+          start = text.find(start_marker)
+          end = text.find(end_marker)
+          if start >= 0 and end >= 0:
+              json_text = text[start + len(start_marker):end].strip()
+              with open('results/benchmark_report.json', 'w') as f:
+                  f.write(json_text)
+              print('JSON report extracted successfully')
+          else:
+              print('WARNING: No JSON markers found in logs')
+          PYEOF
+
+          echo "=== Direct Benchmark Output (tail) ==="
+          tail -40 results/benchmark_output.txt || true
+
+      - name: Upload Direct Benchmark Report (JSON)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-benchmark-report
+          path: results/benchmark_report.json
+          if-no-files-found: warn
+
+      - name: Upload Direct Benchmark Output (Log)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-benchmark-output
+          path: results/benchmark_output.txt
+          if-no-files-found: warn
+
+      # ---- Summary ----
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "# Direct GCS S3-Compatible API Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Network Path:** Benchmark Pod -> storage.googleapis.com (direct, no proxy)" >> $GITHUB_STEP_SUMMARY
+          echo "**SDK:** AWS SDK Go v2 (same as proxy benchmark)" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Benchmark Node Pool:** benchmark-c4-pool-new" >> $GITHUB_STEP_SUMMARY
+          echo "**Concurrency:** ${{ inputs.concurrency }} | **Duration:** ${{ inputs.duration_sec }}s per test" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f results/benchmark_report.json ]; then
+            echo "## Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Test | Size | Ops | ops/s | p50(ms) | p95(ms) | p99(ms) | max(ms) | Errors |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|------|-----|-------|---------|---------|---------|---------|--------|" >> $GITHUB_STEP_SUMMARY
+
+            jq -r '.results[] | "| \(.name) | \(.payload_size) | \(.total_ops) | \(.ops_per_sec | . * 10 | round / 10) | \(.p50_ms | . * 10 | round / 10) | \(.p95_ms | . * 10 | round / 10) | \(.p99_ms | . * 10 | round / 10) | \(.max_ms | . * 10 | round / 10) | \(.errors) |"' results/benchmark_report.json >> $GITHUB_STEP_SUMMARY
+          else
+            echo "> No benchmark_report.json found. Check logs for errors." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ---- Cleanup ----
+      - name: Cleanup Direct Benchmark Job
+        if: always()
+        run: |
+          kubectl delete job direct-benchmark -n ${{ env.K8S_NAMESPACE }} --ignore-not-found

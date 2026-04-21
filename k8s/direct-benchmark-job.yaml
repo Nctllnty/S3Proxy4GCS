@@ -1,0 +1,64 @@
+# Direct GCS S3-Compatible API Benchmark Job.
+# Runs the same AWS SDK Go v2 benchmark directly against storage.googleapis.com,
+# bypassing the S3Proxy, to establish a true apples-to-apples baseline.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: direct-benchmark
+  namespace: s3proxy-e2e
+  labels:
+    app: direct-benchmark
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: direct-benchmark
+    spec:
+      serviceAccountName: s3proxy
+      nodeSelector:
+        cloud.google.com/gke-nodepool: benchmark-c4-pool-new
+      restartPolicy: Never
+      containers:
+        - name: benchmark
+          image: us-east1-docker.pkg.dev/cbs-poctest/s3proxy/s3proxy-benchmark:latest
+          args:
+            - "-test.v"
+            - "-test.count=1"
+            - "-test.timeout=45m"
+            - "-test.run=TestDirectGCSBenchmark"
+          env:
+            # BENCH_MODE=direct: skip proxy health check, use GCS S3-compatible API
+            - name: BENCH_MODE
+              value: "direct"
+            - name: GCS_HMAC_ACCESS
+              valueFrom:
+                secretKeyRef:
+                  name: s3proxy-credentials
+                  key: PROXY_AWS_ACCESS_KEY_ID
+            - name: GCS_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: s3proxy-credentials
+                  key: PROXY_AWS_SECRET_ACCESS_KEY
+            - name: TEST_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: s3proxy-config
+                  key: TARGET_BUCKET
+            - name: TEST_PREFIX
+              value: "direct-bench/"
+            - name: BENCH_CONCURRENCY
+              value: "10"
+            - name: BENCH_DURATION_SEC
+              value: "30"
+            - name: BENCHMARK_NODE_POOL
+              value: "benchmark-c4-pool-new"
+          resources:
+            requests:
+              cpu: "2000m"
+              memory: "4Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
