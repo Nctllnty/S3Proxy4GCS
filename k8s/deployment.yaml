@@ -111,10 +111,10 @@ spec:
             # Guaranteed QoS: requests == limits to avoid CPU throttling
             requests:
               cpu: "1000m"
-              memory: "512Mi"
+              memory: "2Gi"
             limits:
               cpu: "1000m"
-              memory: "512Mi"
+              memory: "2Gi"
           readinessProbe:
             httpGet:
               path: /readyz

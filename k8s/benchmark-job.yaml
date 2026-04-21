@@ -72,7 +72,7 @@ spec:
             # Guaranteed QoS: requests == limits to avoid CPU throttling
             requests:
               cpu: "2000m"
-              memory: "512Mi"
+              memory: "4Gi"
             limits:
               cpu: "2000m"
-              memory: "512Mi"
+              memory: "4Gi"
