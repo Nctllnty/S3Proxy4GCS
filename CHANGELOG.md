@@ -4,6 +4,72 @@ All notable changes to the s3proxy4gcs project are documented in this file.
 Dates are in ISO-8601. Versions follow semver; log/metric label changes are
 listed under "Breaking (observability)" so downstream dashboards can adapt.
 
+## v2.0.0 — Per-client HMAC credential mapping & production hardening (2026-04-18)
+
+### Added
+- **Per-client HMAC credential mapping** (`pkg/credstore`): The proxy now
+  re-signs each inbound S3 request using the originating client's own GCS
+  HMAC AK/SK instead of a single proxy-wide key pair. This enables true
+  multi-tenant isolation — each client can be independently rotated or
+  revoked without affecting other tenants.
+  - `HMAC_CREDENTIALS_FILE` (production): Path to a JSON `{"<AK>":"<SK>"}`
+    map. Mount as a K8s `Secret` volume; updates are hot-reloaded via
+    `fsnotify` within ~200 ms (debounced), no pod restart required.
+  - `HMAC_CREDENTIALS` (dev/local): Inline JSON credential map for `.env`
+    and unit testing.
+  - `HMAC_STRICT` (default `true` when credentials are configured): Rejects
+    requests with unknown access keys via `403 InvalidAccessKeyId`.
+  - Legacy `PROXY_AWS_ACCESS_KEY_ID` / `PROXY_AWS_SECRET_ACCESS_KEY` remain
+    backward-compatible (auto-synthesised to a 1-entry map) with a
+    migration WARN at startup.
+  - `validateClientCredential` in `main.go` extracts the AK from the SigV4
+    `Authorization` header (or `X-Amz-Credential` for presigned URLs),
+    resolves the matching SK, and stores `aws.Credentials` on the request
+    context so the Director can re-sign without a second lookup.
+  - New `pkg/credstore.Store` with `atomic.Value` backing (lock-free reads,
+    zero-allocation hot path), `Watch()` goroutine for fsnotify, and
+    strict input validation.
+- Prometheus metrics for credential mapping:
+  - `s3proxy_hmac_credential_lookups_total{result}` — counts per-request
+    AK lookups (`hit` / `miss` / `no_auth` / `disabled`).
+  - `s3proxy_hmac_credentials_loaded` — gauge of currently loaded AK→SK
+    entries.
+  - `s3proxy_hmac_credentials_reload_total{result}` — counts hot-reload
+    attempts (`success` / `error`).
+- **Request log enrichment**: Two new structured columns in every
+  access-log JSON line:
+  - `access_key`: The client's HMAC access key ID (extracted from SigV4
+    header or presigned query).
+  - `guploader_upload_id`: The `X-GUploader-UploadID` response header from
+    GCS, enabling cross-referencing with GCS-side audit logs.
+- **Multi-arch Docker images**: `Dockerfile` now uses
+  `--platform=$BUILDPLATFORM` with `TARGETOS` / `TARGETARCH` build args,
+  producing both `amd64` and `arm64` images from a single build.
+- **Direct GCS S3-compatible API baseline benchmark**: New
+  `TestDirectGCSBenchmark` in `e2e_tests/` measures raw GCS latency
+  without the proxy, providing a transparent overhead baseline for A/B
+  comparison.
+
+### Changed
+- Go toolchain bumped to **1.25** across `go.mod`, `Dockerfile`, and CI.
+- Documentation fully synchronised with current engineering state:
+  - Go version `1.21+` → `1.25+`.
+  - Multi-SDK test count `60/60` → `78/78` (13 tests × 6 SDKs).
+  - Production deployment memory example `512Mi` → `2Gi` (matches
+    `k8s/deployment.yaml`).
+  - File structure links updated from stale absolute paths to relative.
+  - Removed non-existent `TestVersioning` references from E2E docs.
+- `.env.example` extended with HMAC credential mapping section.
+- `AGENTS.md` rule 15 documents the full credential mapping contract.
+
+### Breaking
+- When `HMAC_CREDENTIALS_FILE` or `HMAC_CREDENTIALS` is set,
+  `HMAC_STRICT` defaults to `true` — requests with access keys not in
+  the map receive `403 InvalidAccessKeyId`. Set `HMAC_STRICT=false` to
+  fall through to the legacy single-key path for a gradual migration.
+
+---
+
 ## v1.6.0 — Three-plane feature flags (2026-04-20)
 
 ### Added
