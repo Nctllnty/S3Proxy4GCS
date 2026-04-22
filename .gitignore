@@ -26,3 +26,4 @@ e2e_tests/benchmark_report.json
 *.pdf
 test_report_final.html
 *.html
+tmp-bench/

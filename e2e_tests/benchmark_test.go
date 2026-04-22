@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -57,6 +58,14 @@ func newGCSS3CleanupClient() *s3.Client {
 	return s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.UsePathStyle = true
 		o.BaseEndpoint = aws.String("https://storage.googleapis.com")
+		o.HTTPClient = &http.Client{
+			Transport: &gcsRoundTripper{
+				base:      http.DefaultTransport,
+				signer:    v4.NewSigner(),
+				awsConfig: cfg,
+			},
+			Timeout: 60 * time.Second,
+		}
 	})
 }
 
@@ -632,6 +641,46 @@ func statsMBs(s Stats) string {
 // Direct GCS Benchmark (AWS SDK Go v2 via GCS S3-compatible API, no proxy)
 // ---------------------------------------------------------------------------
 
+// gcsRoundTripper works around a known incompatibility between AWS SDK Go v2
+// and GCS S3-compatible API: the SDK signs headers (Accept-Encoding,
+// amz-sdk-invocation-id, amz-sdk-request) that GCS does not understand,
+// causing SignatureDoesNotMatch (403). This transport removes Accept-Encoding
+// before signing, re-signs the request, then restores the header.
+// See: https://github.com/aws/aws-sdk-go-v2/issues/1816
+type gcsRoundTripper struct {
+	base      http.RoundTripper
+	signer    *v4.Signer
+	awsConfig aws.Config
+}
+
+func (rt *gcsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Save and strip Accept-Encoding so it is not part of the signature.
+	ae := req.Header.Get("Accept-Encoding")
+	req.Header.Del("Accept-Encoding")
+
+	// Re-sign using the same timestamp the SDK already placed.
+	timeStr := req.Header.Get("X-Amz-Date")
+	timeDate, _ := time.Parse("20060102T150405Z", timeStr)
+
+	creds, err := rt.awsConfig.Credentials.Retrieve(req.Context())
+	if err != nil {
+		return nil, fmt.Errorf("gcsRoundTripper: retrieve credentials: %w", err)
+	}
+
+	// v4.GetPayloadHash reads the x-amz-content-sha256 header the SDK set.
+	err = rt.signer.SignHTTP(req.Context(), creds, req,
+		v4.GetPayloadHash(req.Context()), "s3", rt.awsConfig.Region, timeDate)
+	if err != nil {
+		return nil, fmt.Errorf("gcsRoundTripper: re-sign: %w", err)
+	}
+
+	// Restore Accept-Encoding for the actual HTTP call.
+	if ae != "" {
+		req.Header.Set("Accept-Encoding", ae)
+	}
+	return rt.base.RoundTrip(req)
+}
+
 // newDirectGCSS3Client creates an S3 client that talks directly to GCS via its
 // S3-compatible XML API (storage.googleapis.com). The configuration mirrors
 // NewS3Client exactly (same SDK, Transport, checksum settings) so the ONLY
@@ -666,15 +715,22 @@ func newDirectGCSS3Client(t *testing.T) *s3.Client {
 		t.Fatalf("Failed to load AWS config for direct GCS: %v", err)
 	}
 
-	// Mirror the exact same HTTP Transport as NewS3Client in framework.go
+	baseTransport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	// Wrap transport with GCS re-signing to work around Accept-Encoding
+	// header incompatibility between AWS SDK Go v2 and GCS.
 	return s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.UsePathStyle = true
 		o.BaseEndpoint = aws.String("https://storage.googleapis.com")
 		o.HTTPClient = &http.Client{
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
+			Transport: &gcsRoundTripper{
+				base:      baseTransport,
+				signer:    v4.NewSigner(),
+				awsConfig: cfg,
 			},
 			Timeout: 60 * time.Second,
 		}
