@@ -5,7 +5,7 @@ This project acts as a middleware proxy between AWS S3-compatible client SDKs an
 ## Getting Started
 
 ### Prerequisites
-- **Go 1.21+** (Download from [golang.org](https://golang.org/))
+- **Go 1.25+** (Download from [golang.org](https://golang.org/))
 
 ### Configuration
 The proxy configuration depends on `.env` file or direct environment variables.
@@ -245,7 +245,7 @@ go test -v -count=1 -timeout 30m ./...
 
 ```bash
 # Functional tests only (data plane + control plane + ops endpoints)
-go test -v -count=1 -run 'TestObjectCRUD|TestMultipartUpload|TestStorageClass|TestListObjects|TestVersioning|TestLifecycleCRUD|TestCORSCRUD|TestLoggingCRUD|TestWebsiteCRUD|TestTaggingCRUD|TestHealthEndpoint|TestReadyzEndpoint|TestMetricsEndpoint' ./...
+go test -v -count=1 -run 'TestObjectCRUD|TestMultipartUpload|TestStorageClass|TestListObjects|TestLifecycleCRUD|TestCORSCRUD|TestLoggingCRUD|TestWebsiteCRUD|TestTaggingCRUD|TestHealthEndpoint|TestReadyzEndpoint|TestMetricsEndpoint' ./...
 
 # Stability tests only
 STABILITY_ROUNDS=200 CONCURRENCY=20 go test -v -count=1 -timeout 30m -run 'TestLongRunningCRUD|TestConcurrentOperations|TestControlPlaneConcurrency' ./...
@@ -258,7 +258,7 @@ go test -v -count=1 -timeout 20m -run 'TestBenchmarkSuite' ./...
 
 | Suite | Tests | What It Validates |
 |---|---|---|
-| **Data Plane** | ObjectCRUD, MultipartUpload, StorageClass, ListObjectsV2, Versioning | Object lifecycle, body integrity, storage class translation, version ID mapping |
+| **Data Plane** | ObjectCRUD, MultipartUpload, StorageClass, ListObjectsV2 | Object lifecycle, body integrity, storage class translation, pagination |
 | **Control Plane** | LifecycleCRUD, CORSCRUD, LoggingCRUD, WebsiteCRUD, TaggingCRUD | Full Put→Get→Delete→Get(empty) cycle for each bucket/object configuration |
 | **Operations** | HealthEndpoint, ReadyzEndpoint, MetricsEndpoint | Health check, GCS readiness probe, Prometheus metrics availability |
 | **Stability** | LongRunningCRUD, ConcurrentOperations, ControlPlaneConcurrency | Repeated CRUD loops, parallel goroutine safety, no data mixing |
@@ -278,7 +278,7 @@ Required GitHub Secrets: `GCS_HMAC_ACCESS`, `GCS_HMAC_SECRET`, `TEST_BUCKET`.
 
 ## Multi-SDK Deployment Guide
 
-The proxy has been validated against **6 AWS SDKs** (Go V2, Go V1, Python/boto3, Java V1, Java V2, C++) with 10 test cases each (60/60 PASS). Different SDKs require different client-side configurations to work correctly with the GCS HMAC re-signing proxy.
+The proxy has been validated against **6 AWS SDKs** (Go V2, Go V1, Python/boto3, Java V1, Java V2, C++) with 13 test cases each (78/78 PASS). Different SDKs require different client-side configurations to work correctly with the GCS HMAC re-signing proxy.
 
 ### Proxy-Side Header Stripping (Automatic)
 
@@ -425,10 +425,10 @@ The proxy **must** use Guaranteed QoS (`requests == limits`) in Kubernetes. Burs
 resources:
   requests:
     cpu: "1000m"      # Must equal limits
-    memory: "512Mi"    # Must equal limits
+    memory: "2Gi"     # Must equal limits
   limits:
     cpu: "1000m"
-    memory: "512Mi"
+    memory: "2Gi"
 ```
 
 ### Pod Anti-Affinity (Recommended)
@@ -478,8 +478,9 @@ go run .
 ## 📂 File Structure & Features
 
 ### Root
-- **[main.go](file:///Users/deckardy/gitlab/s3proxy4gcs/main.go)**: Router entry point. Intercepts custom XML operations and falls through to a high-performance Reverse Proxy for all standard object traffic. Uses tuned connection pooling for speed. **Enforces standard S3 XML error responses and propagates request contexts for automatic cost cancellation.**
-- **[config/settings.go](file:///Users/deckardy/gitlab/s3proxy4gcs/config/settings.go)**: Centralized environment configuration (Port, Bucket, DryRun, Connection Limits).
+- **[main.go](main.go)**: Router entry point. Intercepts custom XML operations and falls through to a high-performance Reverse Proxy for all standard object traffic. Uses tuned connection pooling for speed. **Enforces standard S3 XML error responses and propagates request contexts for automatic cost cancellation.**
+- **[config/settings.go](config/settings.go)**: Centralized environment configuration (Port, Bucket, DryRun, Connection Limits, Feature Flags, HMAC Credential Mapping).
+- **[pkg/credstore/](pkg/credstore/)**: Per-client HMAC AK→SK credential store with lock-free reads and fsnotify hot-reload.
 
 ### Package `pkg/translate`
 Handles bi-directional translation between AWS S3 XML schemas and Google Cloud Storage schemas:
@@ -487,8 +488,8 @@ Handles bi-directional translation between AWS S3 XML schemas and Google Cloud S
 - **`gcs_*.go`**: Translates the parsed S3 structs into GCS SDK types or JSON payloads.
 
 #### Feature Files:
-- **[lifecycle](file:///Users/deckardy/gitlab/s3proxy4gcs/pkg/translate/gcs_lifecycle.go)**: Maps Lifecycle settings with rule rejections for unsupported filters.
-- **[cors](file:///Users/deckardy/gitlab/s3proxy4gcs/pkg/translate/gcs_cors.go)**: Maps S3 XML CORS permissions to GCS Go SDK types.
-- **[logging](file:///Users/deckardy/gitlab/s3proxy4gcs/pkg/translate/gcs_logging.go)**: Parses and holds bucket logging specifications.
-- **[website](file:///Users/deckardy/gitlab/s3proxy4gcs/pkg/translate/gcs_website.go)**: Maps main page suffixes and 404 error documents.
-- **[tagging](file:///Users/deckardy/gitlab/s3proxy4gcs/pkg/translate/gcs_tagging.go)**: Translates tags into GCS custom metadata using Optimistic Concurrency Control (OCC) to prevent overwrite losses.
+- **[lifecycle](pkg/translate/gcs_lifecycle.go)**: Maps Lifecycle settings with rule rejections for unsupported filters.
+- **[cors](pkg/translate/gcs_cors.go)**: Maps S3 XML CORS permissions to GCS Go SDK types.
+- **[logging](pkg/translate/gcs_logging.go)**: Parses and holds bucket logging specifications.
+- **[website](pkg/translate/gcs_website.go)**: Maps main page suffixes and 404 error documents.
+- **[tagging](pkg/translate/gcs_tagging.go)**: Translates tags into GCS custom metadata using Optimistic Concurrency Control (OCC) to prevent overwrite losses.

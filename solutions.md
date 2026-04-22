@@ -92,7 +92,7 @@ These features intercept high-frequency data path operations or require heavy ba
 
 ## SDK Compatibility & Client-Side Workarounds
 
-The proxy has been validated against **6 AWS SDKs** with full data-plane and control-plane test coverage (60/60 PASS). Below documents both the known issues and the required client-side configurations for each SDK.
+The proxy has been validated against **6 AWS SDKs** with full data-plane and control-plane test coverage (78/78 PASS). Below documents both the known issues and the required client-side configurations for each SDK.
 
 ### Known Issues & Solutions
 
@@ -306,14 +306,14 @@ layer if required. See `README.md § Feature Flags` for the full matrix.
 | **Unit Tests** | ✅ Implemented | 17 tests across all `pkg/translate` modules |
 | **Integration Tests** | ✅ Implemented | Isolated Go module, auto-spawns local proxy in DryRun |
 | **E2E Acceptance Tests** | ✅ Implemented | Functional + Stability + Benchmark suites against live proxy |
-| **Multi-SDK Tests** | ✅ Validated | 6 SDKs (Go V2, Go V1, Python, Java V1, Java V2, C++) — 60+ tests, all PASS |
+| **Multi-SDK Tests** | ✅ Validated | 6 SDKs (Go V2, Go V1, Python, Java V1, Java V2, C++) — 78 tests (13 each), all PASS |
 | **CI/CD (GitHub Actions)** | ✅ Implemented | E2E workflow (3 parallel jobs) + Multi-SDK workflow (6 SDK jobs) |
 
 ---
 
 ## Open Questions & Next Steps
 
-1. ~~**Target SDKs Compatibility**: The target SDKs are **Go, Java, Python, and C++**.~~ **✅ Resolved**: All 6 SDKs (Go V2, Go V1, Python, Java V1, Java V2, C++) validated with 60+ tests passing. See [Per-SDK Required Configuration](#per-sdk-required-configuration) above.
+1. ~~**Target SDKs Compatibility**: The target SDKs are **Go, Java, Python, and C++**.~~ **✅ Resolved**: All 6 SDKs (Go V2, Go V1, Python, Java V1, Java V2, C++) validated with 78 tests passing (13 per SDK). See [Per-SDK Required Configuration](#per-sdk-required-configuration) above.
 2. **Consistency Requirements**: For features like Tagging via Metadata, is the eventual consistency of GCS metadata acceptable for the customer's application logic?
 3. ~~**Performance Hardening**: Consider implementing request body size limits (`MaxBytesReader`), server-level timeouts, and concurrency limiting middleware.~~ **✅ Resolved**: Implemented read/write split Transport (separate GET/HEAD vs PUT/POST/DELETE proxies with optimized buffer sizes), global SigV4 signer reuse, streaming MD5 for DeleteObjects, parameterized connection pool timeouts (IdleConnTimeout, ResponseHeaderTimeout), and concurrency limiter middleware. **K8s deployment must use Guaranteed QoS (requests==limits) + Pod anti-affinity** — Burstable QoS causes 30~60% throughput loss due to CFS throttling on overcommitted nodes.
 4. ~~**E2E Validation**: Run the E2E acceptance test suite against a live GKE deployment to validate all translations end-to-end.~~ **✅ Resolved**: E2E tests and Multi-SDK CI pipeline validated on GKE.
