@@ -36,12 +36,16 @@ listed under "Breaking (observability)" so downstream dashboards can adapt.
     entries.
   - `s3proxy_hmac_credentials_reload_total{result}` — counts hot-reload
     attempts (`success` / `error`).
-- **Request log enrichment**: Two new structured columns in every
-  access-log JSON line:
+- **Request log enrichment**: Three new fields in both the `slog` JSON
+  stdout log and the `reqlog` CSV access-log file:
+  - `source_ip`: Client IP address (from `X-Forwarded-For`, `X-Real-Ip`,
+    or `RemoteAddr`).
   - `access_key`: The client's HMAC access key ID (extracted from SigV4
     header or presigned query).
   - `guploader_upload_id`: The `X-GUploader-UploadID` response header from
     GCS, enabling cross-referencing with GCS-side audit logs.
+  - `access_key` and `guploader_upload_id` are conditionally emitted in
+    slog (omitted when empty, e.g. health-check probes).
 - **Multi-arch Docker images**: `Dockerfile` now uses
   `--platform=$BUILDPLATFORM` with `TARGETOS` / `TARGETARCH` build args,
   producing both `amd64` and `arm64` images from a single build.

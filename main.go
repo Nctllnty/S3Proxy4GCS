@@ -604,7 +604,8 @@ func (r *statusRecorder) Flush() {
 }
 
 // observabilityMiddleware replaces chi's default Logger middleware with structured
-// JSON logging that includes request_id, method, path, status, duration, and body size.
+// JSON logging that includes request_id, source_ip, method, path, status, duration,
+// body size, and — when present — access_key and guploader_upload_id.
 // It also records Prometheus metrics for every request.
 func observabilityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -631,15 +632,29 @@ func observabilityMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		slog.Info("HTTP request completed",
+		// Extract client identity and GCS trace ID for structured logging.
+		sourceIP := reqlog.ExtractSourceIP(r)
+		accessKey := reqlog.ExtractAccessKey(r)
+		guploaderID := reqlog.ExtractGUploaderUploadID(rec.Header())
+
+		fields := []any{
 			"request_id", reqID,
+			"source_ip", sourceIP,
 			"method", r.Method,
 			"uri", r.RequestURI,
 			"status", rec.status,
 			"duration_ms", duration.Milliseconds(),
 			"content_length", r.ContentLength,
 			"handler", handlerLabel,
-		)
+		}
+		if accessKey != "" {
+			fields = append(fields, "access_key", accessKey)
+		}
+		if guploaderID != "" {
+			fields = append(fields, "guploader_upload_id", guploaderID)
+		}
+
+		slog.Info("HTTP request completed", fields...)
 	})
 }
 
