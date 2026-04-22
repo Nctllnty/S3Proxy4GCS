@@ -35,4 +35,5 @@ sdk-results/
 credential_test.go
 gen_10c_report.py
 gen_500c_report.py
+gen_direct_comparison_report.py
 main_test.go
