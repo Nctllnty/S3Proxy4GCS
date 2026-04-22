@@ -662,10 +662,26 @@ func TestDirectGCSBenchmark(t *testing.T) {
 		report.Results = append(report.Results, result)
 		printBenchResult(t, result)
 
-		// Cleanup
-		t.Logf("  Cleaning up %d objects...", len(putKeys))
-		for _, k := range putKeys {
-			gcsClient.Bucket(bucketName).Object(k).Delete(ctx)
+		// Cleanup: concurrent batch delete (bounded to 50 goroutines)
+		t.Logf("  Cleaning up %d objects (concurrent)...", len(putKeys))
+		{
+			const cleanupWorkers = 50
+			ch := make(chan string, len(putKeys))
+			for _, k := range putKeys {
+				ch <- k
+			}
+			close(ch)
+			var cwg sync.WaitGroup
+			for w := 0; w < cleanupWorkers; w++ {
+				cwg.Add(1)
+				go func() {
+					defer cwg.Done()
+					for k := range ch {
+						gcsClient.Bucket(bucketName).Object(k).Delete(ctx)
+					}
+				}()
+			}
+			cwg.Wait()
 		}
 		t.Logf("  Cleanup done.")
 	}
