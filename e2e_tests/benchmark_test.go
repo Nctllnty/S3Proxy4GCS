@@ -16,9 +16,48 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
+
+// ---------------------------------------------------------------------------
+// GCS S3-compatible cleanup client (used by direct benchmark)
+// ---------------------------------------------------------------------------
+
+// newGCSS3CleanupClient creates an S3 client that talks directly to GCS XML API
+// (storage.googleapis.com) for batch cleanup via DeleteObjects.
+// Returns nil if HMAC credentials are not available.
+func newGCSS3CleanupClient() *s3.Client {
+	ak := os.Getenv("GCS_HMAC_ACCESS")
+	sk := os.Getenv("GCS_HMAC_SECRET")
+	if ak == "" || sk == "" {
+		return nil
+	}
+
+	creds := aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+		return aws.Credentials{
+			AccessKeyID:     ak,
+			SecretAccessKey: sk,
+			Source:          "gcs-cleanup",
+		}, nil
+	})
+
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithCredentialsProvider(creds),
+		config.WithRegion("us-east-1"),
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+	)
+	if err != nil {
+		return nil
+	}
+
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+		o.BaseEndpoint = aws.String("https://storage.googleapis.com")
+	})
+}
 
 // ---------------------------------------------------------------------------
 // Configuration (overridable via environment variables)
@@ -630,6 +669,15 @@ func TestDirectGCSBenchmark(t *testing.T) {
 	t.Logf("Direct GCS Benchmark (native SDK): concurrency=%d, duration=%ds, node_pool=%s", concurrency, durationSec, nodePool)
 	t.Log("")
 
+	// S3 cleanup client for batch DeleteObjects via GCS XML API (1000 keys/batch).
+	// Falls back to individual GCS SDK deletes if HMAC creds are unavailable.
+	s3Cleanup := newGCSS3CleanupClient()
+	if s3Cleanup != nil {
+		t.Log("Using S3 batch DeleteObjects for cleanup (1000 keys/batch via GCS XML API)")
+	} else {
+		t.Log("HMAC credentials not available; falling back to individual GCS SDK deletes for cleanup")
+	}
+
 	// =======================================================================
 	// 1. Multi-tier Upload (direct to GCS)
 	// =======================================================================
@@ -662,10 +710,12 @@ func TestDirectGCSBenchmark(t *testing.T) {
 		report.Results = append(report.Results, result)
 		printBenchResult(t, result)
 
-		// Cleanup: concurrent batch delete (bounded to 200 goroutines)
-		// 500c produces ~350K objects per tier; 50 workers is too slow (>5min/tier).
-		t.Logf("  Cleaning up %d objects (concurrent)...", len(putKeys))
-		{
+		// Cleanup: prefer S3 batch DeleteObjects (1000 keys/batch, ~40x faster)
+		// via GCS XML API; fall back to 200-worker individual deletes.
+		t.Logf("  Cleaning up %d objects...", len(putKeys))
+		if s3Cleanup != nil {
+			cleanupPutKeys(s3Cleanup, bucketName, putKeys, 10)
+		} else {
 			const cleanupWorkers = 200
 			ch := make(chan string, len(putKeys))
 			for _, k := range putKeys {
