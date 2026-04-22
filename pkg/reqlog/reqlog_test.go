@@ -96,24 +96,25 @@ func TestExtractAccessKey(t *testing.T) {
 
 func TestRecordToCSVLine(t *testing.T) {
 	rec := Record{
-		TimestampMs: 1713657600000,
-		RequestID:   "req-abc",
-		SourceIP:    "10.0.0.1",
-		HTTPMethod:  "GET",
-		APIMethod:   "GetObject",
-		Bucket:      "mybucket",
-		AccessKey:   "AKIAIOSFODNN7EXAMPLE",
-		StatusCode:  200,
-		DurationMs:  42,
+		TimestampMs:       1713657600000,
+		RequestID:         "req-abc",
+		SourceIP:          "10.0.0.1",
+		HTTPMethod:        "GET",
+		APIMethod:         "GetObject",
+		Bucket:            "mybucket",
+		AccessKey:         "AKIAIOSFODNN7EXAMPLE",
+		GUploaderUploadID: "ABgVH8_jqfM-xyz",
+		StatusCode:        200,
+		DurationMs:        42,
 	}
 	line := rec.ToCSVLine()
 	fields := strings.Split(line, "\u0001")
-	if len(fields) != 9 {
-		t.Fatalf("expected 9 SOH-delimited fields, got %d: %q", len(fields), fields)
+	if len(fields) != 10 {
+		t.Fatalf("expected 10 SOH-delimited fields, got %d: %q", len(fields), fields)
 	}
 	wantFields := []string{
 		"1713657600000", "req-abc", "10.0.0.1", "GET", "GetObject",
-		"mybucket", "AKIAIOSFODNN7EXAMPLE", "200", "42",
+		"mybucket", "AKIAIOSFODNN7EXAMPLE", "ABgVH8_jqfM-xyz", "200", "42",
 	}
 	for i, w := range wantFields {
 		if fields[i] != w {
@@ -131,5 +132,14 @@ func TestMiddlewarePopulatesAccessKey(t *testing.T) {
 	got := ExtractAccessKey(r)
 	if got != "AKMIDDLEWARE" {
 		t.Fatalf("expected AKMIDDLEWARE, got %q", got)
+	}
+}
+
+func TestExtractGUploaderUploadID(t *testing.T) {
+	h := make(http.Header)
+	h.Set("X-GUploader-UploadID", "ABgVH8_jqfM-captured")
+
+	if got := ExtractGUploaderUploadID(h); got != "ABgVH8_jqfM-captured" {
+		t.Fatalf("expected upload id to be captured, got %q", got)
 	}
 }

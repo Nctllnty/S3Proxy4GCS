@@ -36,15 +36,16 @@ func Init(filePath string, maxSizeMB, maxBackup, chanBuf int) {
 
 // Record holds the fields logged for each request.
 type Record struct {
-	TimestampMs int64
-	RequestID   string
-	SourceIP    string
-	HTTPMethod  string
-	APIMethod   string
-	Bucket      string
-	AccessKey   string
-	StatusCode  int
-	DurationMs  int64
+	TimestampMs       int64
+	RequestID         string
+	SourceIP          string
+	HTTPMethod        string
+	APIMethod         string
+	Bucket            string
+	AccessKey         string
+	GUploaderUploadID string
+	StatusCode        int
+	DurationMs        int64
 }
 
 // ToCSVLine serializes the record as a SOH-delimited (\u0001) line.
@@ -57,6 +58,7 @@ func (rec Record) ToCSVLine() string {
 		rec.APIMethod,
 		rec.Bucket,
 		rec.AccessKey,
+		rec.GUploaderUploadID,
 		strconv.Itoa(rec.StatusCode),
 		strconv.FormatInt(rec.DurationMs, 10),
 	}, "\u0001")
@@ -84,19 +86,25 @@ func Middleware(logger *ymlog.Logger) func(http.Handler) http.Handler {
 			next.ServeHTTP(rec, r)
 
 			entry := Record{
-				TimestampMs: start.UnixMilli(),
-				RequestID:   chiMW.GetReqID(r.Context()),
-				SourceIP:    ExtractSourceIP(r),
-				HTTPMethod:  r.Method,
-				APIMethod:   InferAPIMethod(r),
-				Bucket:      ExtractBucket(r),
-				AccessKey:   ExtractAccessKey(r),
-				StatusCode:  rec.status,
-				DurationMs:  time.Since(start).Milliseconds(),
+				TimestampMs:       start.UnixMilli(),
+				RequestID:         chiMW.GetReqID(r.Context()),
+				SourceIP:          ExtractSourceIP(r),
+				HTTPMethod:        r.Method,
+				APIMethod:         InferAPIMethod(r),
+				Bucket:            ExtractBucket(r),
+				AccessKey:         ExtractAccessKey(r),
+				GUploaderUploadID: ExtractGUploaderUploadID(rec.Header()),
+				StatusCode:        rec.status,
+				DurationMs:        time.Since(start).Milliseconds(),
 			}
 			logger.InfoString(entry.ToCSVLine())
 		})
 	}
+}
+
+// ExtractGUploaderUploadID returns the GCS upload trace ID from the response headers.
+func ExtractGUploaderUploadID(h http.Header) string {
+	return h.Get("X-GUploader-UploadID")
 }
 
 // ExtractSourceIP returns the client IP from X-Forwarded-For (first value),
