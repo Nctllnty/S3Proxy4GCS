@@ -662,10 +662,11 @@ func TestDirectGCSBenchmark(t *testing.T) {
 		report.Results = append(report.Results, result)
 		printBenchResult(t, result)
 
-		// Cleanup: concurrent batch delete (bounded to 50 goroutines)
+		// Cleanup: concurrent batch delete (bounded to 200 goroutines)
+		// 500c produces ~350K objects per tier; 50 workers is too slow (>5min/tier).
 		t.Logf("  Cleaning up %d objects (concurrent)...", len(putKeys))
 		{
-			const cleanupWorkers = 50
+			const cleanupWorkers = 200
 			ch := make(chan string, len(putKeys))
 			for _, k := range putKeys {
 				ch <- k

@@ -30,7 +30,7 @@ jobs:
   direct-benchmark:
     name: Build & Direct GCS Benchmark
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -114,7 +114,7 @@ jobs:
       - name: Wait for Direct Benchmark Completion
         run: |
           kubectl wait --for=condition=complete job/direct-benchmark \
-            -n ${{ env.K8S_NAMESPACE }} --timeout=2700s || true
+            -n ${{ env.K8S_NAMESPACE }} --timeout=5400s || true
 
           STATUS=$(kubectl get job direct-benchmark -n ${{ env.K8S_NAMESPACE }} \
             -o jsonpath='{range .status.conditions[*]}{.type}{"\n"}{end}' \

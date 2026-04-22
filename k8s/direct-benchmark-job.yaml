@@ -26,7 +26,7 @@ spec:
           args:
             - "-test.v"
             - "-test.count=1"
-            - "-test.timeout=45m"
+            - "-test.timeout=90m"
             - "-test.run=TestDirectGCSBenchmark"
           env:
             # BENCH_MODE=direct: skip proxy health check, use native GCS SDK
