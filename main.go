@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"s3proxy4gcs/config"
+	"s3proxy4gcs/pkg/credstore"
 	"s3proxy4gcs/pkg/metrics"
 	"s3proxy4gcs/pkg/translate"
 
@@ -54,6 +55,22 @@ var gcsURL *url.URL
 
 // Global SigV4 signer — reused across all requests to avoid per-request allocation.
 var signer = v4.NewSigner()
+
+// hmacCredentials is the in-memory AK→SK mapping used by the Director to
+// re-sign each inbound request with the client's own credentials. See
+// docs/hmac-credential-mapping-design.md for the architecture. The store
+// is populated at startup from config.Config and optionally watched for
+// hot reload via fsnotify when config.Config.CredentialsFile is set.
+var hmacCredentials = credstore.New()
+
+// resolvedCredsKey is a per-request context key that carries the AWS
+// credentials resolved by `handleS3Request` so the Director re-signs
+// with the same pair picked during AK validation — avoiding a second
+// map lookup on the hot path and guaranteeing the two code sites never
+// disagree.
+type resolvedCredsKeyType struct{}
+
+var resolvedCredsKey = resolvedCredsKeyType{}
 
 func init() {
 	// Prometheus metrics are defined and auto-registered in pkg/metrics.
@@ -85,13 +102,21 @@ func main() {
 
 	gcsCtx = context.Background()
 
-	// Fail-fast on missing HMAC re-sign credentials in live mode.
-	// Without them the proxy would forward unsigned requests to GCS,
-	// triggering 100% 403 rates that are time-consuming to diagnose
-	// in production.
-	if !config.Config.DryRun {
-		if config.Config.ProxyAccessKey == "" || config.Config.ProxySecretKey == "" {
-			log.Fatal("FATAL: PROXY_AWS_ACCESS_KEY_ID / PROXY_AWS_SECRET_ACCESS_KEY are required when DRY_RUN=false. Set them via env or .env to avoid silent SignatureDoesNotMatch loops.")
+	// Fail-fast on missing HMAC re-sign credentials in live mode. Without
+	// them the proxy would forward unsigned requests to GCS, triggering
+	// 100% 403 rates that are time-consuming to diagnose in production.
+	// config.LoadConfig already fatals if no credentials source is set
+	// for non-DryRun; here we only seed the atomic store and optionally
+	// start the fsnotify hot-reload watcher.
+	if len(config.Config.HMACCredentials) > 0 {
+		hmacCredentials.Replace(config.Config.HMACCredentials)
+	}
+	if path := config.Config.CredentialsFile; path != "" {
+		if _, err := hmacCredentials.Watch(path, nil); err != nil {
+			slog.Error("Failed to start HMAC credentials watcher; continuing with initial snapshot",
+				"path", path, "error", err)
+		} else {
+			slog.Info("HMAC credentials hot-reload enabled", "path", path)
 		}
 	}
 
@@ -262,77 +287,85 @@ func main() {
 		}
 
 		if shouldResign {
-			if config.Config.ProxyAccessKey == "" || config.Config.ProxySecretKey == "" {
-				slog.Warn("Proxy HMAC credentials not set! Re-signing skipped. Signature will fail at GCS.")
-			} else {
-				// Always use UNSIGNED-PAYLOAD for re-signing.
-				// Some SDKs (Go V1, Java V2) compute the actual body SHA256,
-				// but GCS HMAC may not verify body hashes correctly through
-				// the reverse proxy. UNSIGNED-PAYLOAD works universally.
-				payloadHash := "UNSIGNED-PAYLOAD"
-				req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-
-				awsCreds := aws.Credentials{
+			// Prefer per-request credentials resolved at handleS3Request time
+			// (the client's own AK/SK, looked up against the mapping store).
+			// Fall back to the legacy single-pair when the mapping is empty
+			// or the request took the non-validated path (e.g. DryRun unit
+			// tests that never populate the store).
+			awsCreds, haveCreds := credentialsFromContext(req.Context())
+			if !haveCreds {
+				if config.Config.ProxyAccessKey == "" || config.Config.ProxySecretKey == "" {
+					slog.Warn("Proxy HMAC credentials not set! Re-signing skipped. Signature will fail at GCS.")
+					return
+				}
+				awsCreds = aws.Credentials{
 					AccessKeyID:     config.Config.ProxyAccessKey,
 					SecretAccessKey: config.Config.ProxySecretKey,
 				}
+			}
 
-				// Strip headers that interfere with GCS HMAC signature verification.
-				req.Header.Del("User-Agent")
-				req.Header.Del("Expect")
-				req.Header.Del("Amz-Sdk-Invocation-Id")
-				req.Header.Del("Amz-Sdk-Request")
-				req.Header.Del("X-Amz-Decoded-Content-Length")
-				req.Header.Del("X-Amz-Trailer")
-				req.Header.Del("Accept-Encoding")
-				if ce := req.Header.Get("Content-Encoding"); strings.Contains(ce, "aws-chunked") {
-					req.Header.Del("Content-Encoding")
-				}
+			// Always use UNSIGNED-PAYLOAD for re-signing.
+			// Some SDKs (Go V1, Java V2) compute the actual body SHA256,
+			// but GCS HMAC may not verify body hashes correctly through
+			// the reverse proxy. UNSIGNED-PAYLOAD works universally.
+			payloadHash := "UNSIGNED-PAYLOAD"
+			req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-				// For POST ?delete (DeleteObjects), GCS requires Content-MD5.
-				// Stream-compute MD5 from body using io.TeeReader (single pass).
-				if req.Method == http.MethodPost && req.URL.Query().Has("delete") && req.Body != nil {
-					var buf bytes.Buffer
-					var h hash.Hash = md5.New()
-					_, readErr := io.Copy(&buf, io.TeeReader(req.Body, h))
-					req.Body.Close()
-					if readErr == nil {
-						req.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(h.Sum(nil)))
-						req.Body = io.NopCloser(&buf)
-						req.ContentLength = int64(buf.Len())
-						if config.Config.DebugLogging {
-							slog.Debug("Computed Content-MD5 for POST ?delete",
-								"bodyLen", buf.Len(),
-								"md5", req.Header.Get("Content-Md5"))
-						}
-					}
-				} else {
-					req.Header.Del("Content-Md5")
-				}
+			// Strip headers that interfere with GCS HMAC signature verification.
+			req.Header.Del("User-Agent")
+			req.Header.Del("Expect")
+			req.Header.Del("Amz-Sdk-Invocation-Id")
+			req.Header.Del("Amz-Sdk-Request")
+			req.Header.Del("X-Amz-Decoded-Content-Length")
+			req.Header.Del("X-Amz-Trailer")
+			req.Header.Del("Accept-Encoding")
+			if ce := req.Header.Get("Content-Encoding"); strings.Contains(ce, "aws-chunked") {
+				req.Header.Del("Content-Encoding")
+			}
 
-				// Debug: log all headers before re-signing (temporary)
-				if config.Config.DebugLogging {
-					for k, v := range req.Header {
-						slog.Debug("Pre-sign header", "key", k, "value", v)
+			// For POST ?delete (DeleteObjects), GCS requires Content-MD5.
+			// Stream-compute MD5 from body using io.TeeReader (single pass).
+			if req.Method == http.MethodPost && req.URL.Query().Has("delete") && req.Body != nil {
+				var buf bytes.Buffer
+				var h hash.Hash = md5.New()
+				_, readErr := io.Copy(&buf, io.TeeReader(req.Body, h))
+				req.Body.Close()
+				if readErr == nil {
+					req.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(h.Sum(nil)))
+					req.Body = io.NopCloser(&buf)
+					req.ContentLength = int64(buf.Len())
+					if config.Config.DebugLogging {
+						slog.Debug("Computed Content-MD5 for POST ?delete",
+							"bodyLen", buf.Len(),
+							"md5", req.Header.Get("Content-Md5"))
 					}
 				}
+			} else {
+				req.Header.Del("Content-Md5")
+			}
 
-				signStart := time.Now()
-				signErr := signer.SignHTTP(req.Context(), awsCreds, req, payloadHash, "s3", "us-east-1", time.Now())
-				metrics.ResignDurationSeconds.Observe(time.Since(signStart).Seconds())
-				if signErr != nil {
-					slog.Error("Failed to re-sign request", "error", signErr)
-				} else if config.Config.DebugLogging {
-					// Debug-only: signed request trace. Authorization intentionally redacted.
-					slog.Debug("Successfully re-signed request for GCS",
-						"method", req.Method,
-						"url", req.URL.String(),
-						"host", req.Host,
-						"content-length", req.ContentLength,
-						"content-type", req.Header.Get("Content-Type"),
-						"x-amz-sha256", req.Header.Get("X-Amz-Content-Sha256"),
-					)
+			// Debug: log all headers before re-signing (temporary)
+			if config.Config.DebugLogging {
+				for k, v := range req.Header {
+					slog.Debug("Pre-sign header", "key", k, "value", v)
 				}
+			}
+
+			signStart := time.Now()
+			signErr := signer.SignHTTP(req.Context(), awsCreds, req, payloadHash, "s3", "us-east-1", time.Now())
+			metrics.ResignDurationSeconds.Observe(time.Since(signStart).Seconds())
+			if signErr != nil {
+				slog.Error("Failed to re-sign request", "error", signErr)
+			} else if config.Config.DebugLogging {
+				// Debug-only: signed request trace. Authorization intentionally redacted.
+				slog.Debug("Successfully re-signed request for GCS",
+					"method", req.Method,
+					"url", req.URL.String(),
+					"host", req.Host,
+					"content-length", req.ContentLength,
+					"content-type", req.Header.Get("Content-Type"),
+					"x-amz-sha256", req.Header.Get("X-Amz-Content-Sha256"),
+				)
 			}
 		}
 	}
@@ -740,9 +773,81 @@ func translateS3StorageClass(sc string) (string, bool) {
 	}
 }
 
+// credentialsFromContext extracts the AWS credentials stashed into the
+// request context by validateClientCredential. The boolean is false when
+// no credentials were resolved (e.g. the store is empty and the request
+// is routed through the legacy single-key fallback).
+func credentialsFromContext(ctx context.Context) (aws.Credentials, bool) {
+	v, ok := ctx.Value(resolvedCredsKey).(aws.Credentials)
+	return v, ok
+}
+
+// validateClientCredential inspects the SigV4 Authorization header,
+// looks the access key up in the in-memory credential store and returns
+// the resolved credentials. It short-circuits with an S3-compatible
+// error response when:
+//
+//   - the store is non-empty but the request carries no Authorization
+//     header → 403 AccessDenied
+//   - the store is non-empty and the AK is not found → 403 InvalidAccessKeyId
+//
+// When the store is empty (no HMAC_CREDENTIALS / HMAC_CREDENTIALS_FILE
+// configured and no legacy single-key either) the function returns
+// ok=false so the caller can either fall back to the legacy single-key
+// path (if HMACStrict=false) or proceed unvalidated (DryRun local tests).
+func validateClientCredential(w http.ResponseWriter, r *http.Request) (aws.Credentials, bool) {
+	if hmacCredentials.Size() == 0 {
+		metrics.HMACCredentialLookups.WithLabelValues("disabled").Inc()
+		return aws.Credentials{}, false
+	}
+
+	authz := r.Header.Get("Authorization")
+	ak, err := credstore.ExtractAccessKey(authz)
+	if err != nil {
+		// Fall back to presigned URL query-param credentials before giving up.
+		if qak, qerr := credstore.ExtractAccessKeyFromQuery(r.URL.RawQuery); qerr == nil {
+			ak = qak
+		} else {
+			metrics.HMACCredentialLookups.WithLabelValues("no_auth").Inc()
+			reqLogger(r.Context()).Warn("Rejecting request without SigV4 credential",
+				"method", r.Method, "uri", r.RequestURI)
+			writeS3Error(w, http.StatusForbidden, "AccessDenied",
+				"Request is missing a valid SigV4 Authorization header.")
+			return aws.Credentials{}, false
+		}
+	}
+
+	sk, found := hmacCredentials.Lookup(ak)
+	if !found {
+		metrics.HMACCredentialLookups.WithLabelValues("miss").Inc()
+		reqLogger(r.Context()).Warn("Rejecting request with unknown access key",
+			"ak", ak, "method", r.Method, "uri", r.RequestURI)
+		writeS3Error(w, http.StatusForbidden, "InvalidAccessKeyId",
+			"The AWS Access Key Id you provided does not exist in our records.")
+		return aws.Credentials{}, false
+	}
+
+	metrics.HMACCredentialLookups.WithLabelValues("hit").Inc()
+	creds := aws.Credentials{AccessKeyID: ak, SecretAccessKey: sk}
+	*r = *r.WithContext(context.WithValue(r.Context(), resolvedCredsKey, creds))
+	return creds, true
+}
+
 func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	log := reqLogger(r.Context())
 	log.Info("Received S3 Request", "method", r.Method, "uri", r.RequestURI)
+
+	// Credential mapping gate: if a per-client AK→SK store is configured,
+	// every request must carry a SigV4 credential that maps to a known
+	// secret before any handler runs. Turning it off is only possible by
+	// leaving HMAC_CREDENTIALS{,_FILE} unset, which degrades to the
+	// legacy single-key re-sign path — useful for local DryRun tests and
+	// the pre-v1.7 deployments tracked in docs/hmac-credential-mapping-design.md.
+	if hmacCredentials.Size() > 0 {
+		if _, ok := validateClientCredential(w, r); !ok {
+			return
+		}
+	}
 
 	// Fail fast on unknown x-amz-storage-class values. Previously we
 	// silently remapped them to NEARLINE, which violated AGENTS rule 4

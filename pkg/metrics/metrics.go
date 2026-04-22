@@ -139,6 +139,45 @@ var (
 		},
 		[]string{"feature"},
 	)
+
+	// HMACCredentialLookups counts per-client AK lookups on the re-sign hot
+	// path. Labels are `result`:
+	//   - "hit": AK matched an entry in the store (request re-signed with
+	//            the client's own secret)
+	//   - "miss": AK not found (request was rejected with InvalidAccessKeyId)
+	//   - "no_auth": Authorization header missing / malformed (request was
+	//            rejected with AccessDenied)
+	//   - "disabled": store empty and legacy single-key fallback active
+	//            (mapping mode off; proxy is using the legacy path)
+	// Used in docs/SLO.md to monitor credential-mapping health.
+	HMACCredentialLookups = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_hmac_credential_lookups_total",
+			Help: "Total number of HMAC credential lookups performed by the Director, by result.",
+		},
+		[]string{"result"},
+	)
+
+	// HMACCredentialsLoaded reports the number of AK→SK entries currently
+	// held by the credential store. Useful for wiring an alert if the map
+	// suddenly drops to zero (likely a malformed Secret rollout).
+	HMACCredentialsLoaded = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "s3proxy_hmac_credentials_loaded",
+			Help: "Current number of AK→SK entries loaded in the HMAC credential store.",
+		},
+	)
+
+	// HMACCredentialsReloadTotal counts hot-reload attempts triggered by
+	// fsnotify. `result` is "success" or "error"; a non-zero error count
+	// usually means the K8s Secret was published with malformed JSON.
+	HMACCredentialsReloadTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_hmac_credentials_reload_total",
+			Help: "Total number of HMAC credential hot-reload attempts, by result.",
+		},
+		[]string{"result"},
+	)
 )
 
 // ClassifyGCSError maps an HTTP status code to a low-cardinality status_class

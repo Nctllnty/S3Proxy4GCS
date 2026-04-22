@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+
+	"s3proxy4gcs/pkg/credstore"
 )
 
 // FeatureFlags gates every externally-visible operation exposed by the proxy.
@@ -61,10 +63,32 @@ type Settings struct {
 	ResponseHeaderTimeout time.Duration // Max wait for response headers from GCS
 	ReadBufferSize        int           // TCP read buffer size for read-path Transport
 	WriteBufferSize       int           // TCP write buffer size for write-path Transport
-	ProxyAccessKey        string        // For re-signing
-	ProxySecretKey        string        // For re-signing
+	ProxyAccessKey        string        // Legacy single-key fallback (AK)
+	ProxySecretKey        string        // Legacy single-key fallback (SK)
 	JSONKey               string        // Path to GCS Service Account JSON key
 	ProxyBaseDomain       string        // Base domain for virtual-hosted style support
+
+	// HMACCredentials is the in-memory AK→SK mapping used by the Director
+	// to re-sign each inbound request with the client's own credentials.
+	// Populated from HMAC_CREDENTIALS (inline JSON), HMAC_CREDENTIALS_FILE
+	// (volume-mounted K8s Secret), or synthesised from the legacy single-
+	// key env vars for zero-config upgrades. See
+	// docs/hmac-credential-mapping-design.md for the full specification.
+	HMACCredentials map[string]string
+
+	// CredentialsFile is the path to the JSON credential map watched for
+	// hot reload via fsnotify. Empty when credentials were loaded from an
+	// inline env var or the legacy single-key fallback.
+	CredentialsFile string
+
+	// HMACStrict forces the Director to reject requests whose access key
+	// is not in HMACCredentials with `403 InvalidAccessKeyId`. When false
+	// (legacy behaviour, used as the fallback when only the single-key
+	// vars are configured), the proxy falls back to the single-key path
+	// and a migration WARN is logged at startup. Controlled by
+	// HMAC_STRICT — defaults to true once HMAC_CREDENTIALS* is set and
+	// false otherwise.
+	HMACStrict bool
 
 	// PPROFAddr controls the optional pprof profiling endpoint. Empty (default)
 	// keeps it disabled; set e.g. "127.0.0.1:6060" to expose runtime profiles
@@ -221,6 +245,11 @@ func LoadConfig() {
 		MetricsEndpoint: getEnvBool("ENABLE_METRICS_ENDPOINT", true),
 	}
 
+	proxyAK := getEnv("PROXY_AWS_ACCESS_KEY_ID", getEnv("AWS_ACCESS_KEY_ID", ""))
+	proxySK := getEnv("PROXY_AWS_SECRET_ACCESS_KEY", getEnv("AWS_SECRET_ACCESS_KEY", ""))
+	credsMap, credsFile, credsSource := loadHMACCredentials(proxyAK, proxySK)
+	hmacStrict := getEnvBool("HMAC_STRICT", credsSource != "legacy")
+
 	Config = &Settings{
 		Port:                      getEnv("PORT", "8080"),
 		GCPProjectID:              getEnv("GCP_PROJECT_ID", ""),
@@ -237,8 +266,11 @@ func LoadConfig() {
 		ResponseHeaderTimeout:     time.Duration(responseHeaderTimeoutSec) * time.Second,
 		ReadBufferSize:            readBufferSize,
 		WriteBufferSize:           writeBufferSize,
-		ProxyAccessKey:            getEnv("PROXY_AWS_ACCESS_KEY_ID", getEnv("AWS_ACCESS_KEY_ID", "")),
-		ProxySecretKey:            getEnv("PROXY_AWS_SECRET_ACCESS_KEY", getEnv("AWS_SECRET_ACCESS_KEY", "")),
+		ProxyAccessKey:            proxyAK,
+		ProxySecretKey:            proxySK,
+		HMACCredentials:           credsMap,
+		CredentialsFile:           credsFile,
+		HMACStrict:                hmacStrict,
 		JSONKey:                   getEnv("JSON_KEY", ""),
 		ProxyBaseDomain:           getEnv("PROXY_BASE_DOMAIN", ""),
 		PPROFAddr:                 getEnv("PPROF_ADDR", ""),
@@ -260,9 +292,60 @@ func LoadConfig() {
 		if Config.GCPProjectID == "" {
 			log.Println("WARNING: GCP_PROJECT_ID is empty, some GCS operations may fail")
 		}
+		if len(credsMap) == 0 && credsFile == "" {
+			log.Fatal("FATAL: no HMAC credentials configured; set HMAC_CREDENTIALS, HMAC_CREDENTIALS_FILE, or PROXY_AWS_ACCESS_KEY_ID/PROXY_AWS_SECRET_ACCESS_KEY when DRY_RUN=false")
+		}
 	}
 
+	logHMACCredentialsSummary(credsSource, credsFile, len(credsMap), hmacStrict)
 	logFeatureFlags(features)
+}
+
+// loadHMACCredentials resolves the AK→SK mapping using, in order:
+//
+//  1. HMAC_CREDENTIALS_FILE — path to a JSON map, loaded once at startup
+//     and watched for hot reload by main.go (fsnotify in pkg/credstore).
+//  2. HMAC_CREDENTIALS       — inline JSON map (legacy / simple deployments).
+//  3. PROXY_AWS_ACCESS_KEY_ID + PROXY_AWS_SECRET_ACCESS_KEY or the plain
+//     AWS_* variants — wrapped into a single-entry map so clients that
+//     still share the one proxy identity keep working unchanged.
+//
+// The third return value is a source tag used only in the startup log
+// ("file" | "inline" | "legacy" | "none") so operators can see where
+// their credentials came from.
+func loadHMACCredentials(legacyAK, legacySK string) (map[string]string, string, string) {
+	if path := os.Getenv("HMAC_CREDENTIALS_FILE"); path != "" {
+		m, err := credstore.LoadFile(path)
+		if err != nil {
+			log.Fatalf("FATAL: HMAC_CREDENTIALS_FILE=%q invalid: %v", path, err)
+		}
+		return m, path, "file"
+	}
+	if raw := os.Getenv("HMAC_CREDENTIALS"); raw != "" {
+		m, err := credstore.ParseJSON(raw)
+		if err != nil {
+			log.Fatalf("FATAL: HMAC_CREDENTIALS is not a valid JSON map[AK]SK: %v", err)
+		}
+		return m, "", "inline"
+	}
+	if legacyAK != "" && legacySK != "" {
+		return map[string]string{legacyAK: legacySK}, "", "legacy"
+	}
+	return map[string]string{}, "", "none"
+}
+
+func logHMACCredentialsSummary(source, path string, count int, strict bool) {
+	switch source {
+	case "file":
+		slog.Info("HMAC credentials loaded from file", "path", path, "count", count, "strict", strict)
+	case "inline":
+		slog.Info("HMAC credentials loaded from HMAC_CREDENTIALS env var", "count", count, "strict", strict)
+	case "legacy":
+		slog.Warn("HMAC credentials loaded from legacy PROXY_AWS_ACCESS_KEY_ID/SECRET — single identity for all clients; migrate to HMAC_CREDENTIALS_FILE for per-client mapping",
+			"count", count, "strict", strict)
+	case "none":
+		slog.Warn("HMAC credentials mapping is empty — re-signing will be skipped; acceptable only for DRY_RUN=true tests")
+	}
 }
 
 // logFeatureFlags emits a single Info summary of every feature flag and an

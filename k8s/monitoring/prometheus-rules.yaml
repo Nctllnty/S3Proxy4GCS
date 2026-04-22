@@ -6,6 +6,8 @@
 #   * Control-plane stability  No 5xx      (lifecycle/cors/logging/website/tagging)
 #   * Throttle saturation      In-flight   (concurrency limiter headroom)
 #   * GCS backend health       SDK errors  (control-plane GCS SDK failures)
+#   * HMAC credential mapping  (v1.7+)     (store populated, miss rate low,
+#                                           hot-reload succeeds)
 #
 # Labels mirror the ServiceMonitor (namespace s3proxy-e2e, app s3proxy) so
 # alerts route to the same team that owns the proxy.
@@ -113,3 +115,72 @@ spec:
             description: |
               Prometheus cannot scrape `/metrics` for 2 minutes. Check the pod
               (liveness probe, OOMKill), node, and ServiceMonitor selector.
+
+        # --- HMAC credential store empty (v1.7+) -----------------------
+        # A pod with zero entries rejects every client request with
+        # InvalidAccessKeyId. This is almost always caused by a bad
+        # Secret rollout (malformed JSON, missing `credentials.json`
+        # key, or the volume not mounting) and never by a legitimate
+        # deployment, so the alert is wired straight to pager.
+        - alert: S3ProxyHMACCredentialsEmpty
+          expr: s3proxy_hmac_credentials_loaded == 0
+          for: 2m
+          labels:
+            severity: critical
+            slo: credential-mapping
+          annotations:
+            summary: "S3Proxy credential map is empty — all clients blocked"
+            description: |
+              `s3proxy_hmac_credentials_loaded` has been 0 for 2 minutes on
+              `{{ $labels.pod }}`. Verify the mounted Secret with:
+                kubectl -n s3proxy-e2e get secret s3proxy-hmac-credentials \
+                  -o jsonpath='{.data.credentials\.json}' | base64 -d | jq .
+              Until fixed, every request returns 403 InvalidAccessKeyId.
+            runbook: docs/SLO.md#related-runbooks
+
+        # --- HMAC credential miss rate (v1.7+) -------------------------
+        # Two fault classes both surface here:
+        #   1. A legitimate client is signing with a stale AK after
+        #      rotation (fix: re-run scripts/create-client-hmac.sh, tell
+        #      the tenant to refresh).
+        #   2. A scanner is probing the endpoint with random AKs
+        #      (fix: correlate with reqlog source IP, block at NetworkPolicy).
+        # Either way a sustained >5% miss rate wants a human.
+        - alert: S3ProxyHMACCredentialMissHigh
+          expr: |
+            sum(rate(s3proxy_hmac_credential_lookups_total{result="miss"}[5m]))
+            /
+            sum(rate(s3proxy_hmac_credential_lookups_total{result=~"hit|miss|no_auth"}[5m]))
+            > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            slo: credential-mapping
+          annotations:
+            summary: "S3Proxy HMAC credential miss rate > 5%"
+            description: |
+              More than 5% of SigV4 credential lookups are missing in the
+              map over the last 5m. Either a client has stale credentials
+              after a rotation or the proxy is being scanned. Correlate the
+              source IPs in the reqlog CSV and cross-check Secret contents.
+
+        # --- HMAC credential hot-reload errors (v1.7+) -----------------
+        # A non-zero reload error means fsnotify fired but strict JSON
+        # validation failed. The in-memory snapshot is retained so the
+        # pod keeps serving — do NOT restart until the Secret is fixed,
+        # otherwise the new pod will boot with an empty map and trip
+        # S3ProxyHMACCredentialsEmpty.
+        - alert: S3ProxyHMACCredentialReloadFailed
+          expr: increase(s3proxy_hmac_credentials_reload_total{result="error"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            slo: credential-mapping
+          annotations:
+            summary: "S3Proxy HMAC credentials hot-reload failed"
+            description: |
+              `fsnotify` observed a Secret update but the new payload
+              failed `pkg/credstore.parse` validation. The previous
+              snapshot is still active; fix the Secret JSON before
+              rolling the deployment, otherwise the pod will come up
+              with zero credentials loaded.

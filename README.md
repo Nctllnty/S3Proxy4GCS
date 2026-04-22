@@ -23,7 +23,11 @@ Available Configuration Options:
 -   `GCS_PREFIX`: Subfolder prefix for testing or namespacing.
 -   `DRY_RUN` (Default: `true`): Disables real GCS API hits (safe for laptop testing). Set to `false` for live integration.
 -   `JSON_KEY`: Path to the Google Cloud Service Account JSON key (required for real GCS API calls like Website/CORS).
--   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: Proxy's HMAC credentials for re-signing requests to GCS.
+-   `HMAC_CREDENTIALS_FILE` (v1.7+, production): Path to a JSON `{"<AK>":"<SK>", ...}` credential map. Mount via a K8s `Secret` volume (see `k8s/deployment.yaml`) — updates are hot-reloaded via `fsnotify` within ~1 s, no pod restart required. See [`docs/hmac-credential-mapping-design.md`](docs/hmac-credential-mapping-design.md) for the full design.
+-   `HMAC_CREDENTIALS` (v1.7+, dev/local): Inline JSON credential map. Same shape as the file above; useful for `.env` and unit tests.
+-   `HMAC_STRICT` (Default: `true` when either of the above is set): Reject requests whose access key is not in the map with `403 InvalidAccessKeyId`. Set to `false` to fall through to the legacy single-key path below.
+-   `PROXY_AWS_ACCESS_KEY_ID` / `PROXY_AWS_SECRET_ACCESS_KEY` (legacy, pre-v1.7): Single proxy-wide HMAC credentials. Auto-wrapped into a 1-entry map at startup and a migration WARN is logged. Plan to migrate to `HMAC_CREDENTIALS_FILE` before rotating per-tenant keys.
+-   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: Ultimate fallback used only when none of the above is set. Retained for drop-in compatibility with AWS tooling during local development.
 -   `PROXY_BASE_DOMAIN`: Base domain for virtual-hosted style support (e.g. `s3proxy.example.com`). When set, the proxy automatically converts virtual-hosted style requests (`bucket.s3proxy.example.com/key`) to path-style (`/bucket/key`). Requires wildcard DNS (`*.s3proxy.example.com → proxy IP`). Default: empty (disabled).
 -   `MAX_IDLE_CONNS` (Default: `1000`): Maximum idle connections for the reverse proxy.
 -   `MAX_IDLE_CONNS_PER_HOST` (Default: `1000`): Maximum idle connections per host for the reverse pool.

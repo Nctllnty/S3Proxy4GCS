@@ -81,16 +81,17 @@ spec:
               value: "30"
             - name: PROXY_BASE_DOMAIN
               value: "s3proxy.lb.local"
-            - name: PROXY_AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: s3proxy-credentials
-                  key: PROXY_AWS_ACCESS_KEY_ID
-            - name: PROXY_AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: s3proxy-credentials
-                  key: PROXY_AWS_SECRET_ACCESS_KEY
+            # ---- HMAC Credential Mapping (v1.7+) ----
+            # The proxy re-signs each request with the client's own GCS HMAC
+            # key pair. The mapping lives in the `s3proxy-hmac-credentials`
+            # Secret (key: credentials.json). Rotate by running
+            # `scripts/create-client-hmac.sh` and applying the new Secret;
+            # fsnotify picks up the kubelet symlink swap within seconds, no
+            # pod restart required. See docs/hmac-credential-mapping-design.md.
+            - name: HMAC_CREDENTIALS_FILE
+              value: /etc/s3proxy/credentials.json
+            - name: HMAC_STRICT
+              value: "true"
             # ---- Request Log System ----
             - name: REQUEST_LOG_ENABLED
               value: "true"
@@ -107,6 +108,9 @@ spec:
           volumeMounts:
             - name: log-volume
               mountPath: /var/log/s3proxy
+            - name: hmac-credentials
+              mountPath: /etc/s3proxy
+              readOnly: true
           resources:
             # Guaranteed QoS: requests == limits to avoid CPU throttling
             requests:
@@ -130,3 +134,12 @@ spec:
       volumes:
         - name: log-volume
           emptyDir: {}
+        - name: hmac-credentials
+          secret:
+            secretName: s3proxy-hmac-credentials
+            # Kubernetes updates Secret volume mounts atomically via the
+            # `..data` symlink. fsnotify in pkg/credstore watches the parent
+            # directory so hot-reload works without any further tweaks.
+            items:
+              - key: credentials.json
+                path: credentials.json

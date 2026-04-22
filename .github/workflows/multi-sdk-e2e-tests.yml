@@ -66,9 +66,16 @@ jobs:
         run: |
           IMAGE="${{ env.GAR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}"
           kubectl apply -f k8s/namespace.yaml
-          kubectl create secret generic s3proxy-credentials \
-            --from-literal=PROXY_AWS_ACCESS_KEY_ID=${{ secrets.GCS_HMAC_ACCESS }} \
-            --from-literal=PROXY_AWS_SECRET_ACCESS_KEY=${{ secrets.GCS_HMAC_SECRET }} \
+          # v1.7+: the Deployment consumes per-client AK→SK via the
+          # `s3proxy-hmac-credentials` Secret. For CI we register a single
+          # synthetic tenant using the same HMAC key pair that the SDK
+          # tests sign with, keeping the E2E auth surface identical to
+          # production while avoiding a second round-trip to IAM.
+          # See docs/hmac-credential-mapping-design.md.
+          CREDENTIALS_JSON="$(jq -cn --arg ak "${{ secrets.GCS_HMAC_ACCESS }}" \
+            --arg sk "${{ secrets.GCS_HMAC_SECRET }}" '{($ak): $sk}')"
+          kubectl create secret generic s3proxy-hmac-credentials \
+            --from-literal=credentials.json="${CREDENTIALS_JSON}" \
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           kubectl create secret generic s3proxy-config \
             --from-literal=TARGET_BUCKET=${{ secrets.TEST_BUCKET }} \
