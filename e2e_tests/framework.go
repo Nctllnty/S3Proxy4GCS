@@ -114,7 +114,6 @@ func GenerateTestKey(env *Env, suffix string) string {
 	return fmt.Sprintf("%s%s-%d", env.TestPrefix, suffix, ts)
 }
 
-
 // Cleanup deletes the given object keys from the bucket, ignoring errors.
 // Intended to be called in a defer or t.Cleanup.
 func Cleanup(t *testing.T, client *s3.Client, bucket string, keys ...string) {

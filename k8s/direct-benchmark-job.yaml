@@ -45,19 +45,17 @@ spec:
               value: "30"
             - name: BENCHMARK_NODE_POOL
               value: "benchmark-c4-pool-new"
-            # HMAC credentials for S3 batch DeleteObjects cleanup via GCS XML API
+            # HMAC credentials required for AWS SDK Go v2 → GCS S3-compatible API
             - name: GCS_HMAC_ACCESS
               valueFrom:
                 secretKeyRef:
                   name: s3proxy-hmac-credentials
                   key: hmac-access
-                  optional: true
             - name: GCS_HMAC_SECRET
               valueFrom:
                 secretKeyRef:
                   name: s3proxy-hmac-credentials
                   key: hmac-secret
-                  optional: true
           resources:
             requests:
               cpu: "2000m"
