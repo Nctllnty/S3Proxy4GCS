@@ -30,3 +30,9 @@ tmp-bench/
 tmp-c3d/
 tmp-c4d/
 sdk-results/
+
+# Temporary scripts
+credential_test.go
+gen_10c_report.py
+gen_500c_report.py
+main_test.go
