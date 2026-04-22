@@ -27,3 +27,6 @@ e2e_tests/benchmark_report.json
 test_report_final.html
 *.html
 tmp-bench/
+tmp-c3d/
+tmp-c4d/
+sdk-results/
