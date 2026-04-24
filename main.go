@@ -194,8 +194,20 @@ func main() {
 			"WriteBufferSize", config.Config.WriteBufferSize)
 	}
 
-	// Immediate flush on read proxy — reduces time-to-first-byte for GET/HEAD streaming.
-	readProxy.FlushInterval = -1
+	// FlushInterval on read proxy controls how quickly data is sent to clients.
+	// -1 = immediate flush after each Write (best TTFB, more syscalls)
+	//  0 = no active flushing (framework-controlled, buffers until full)
+	// >0 = periodic flush at the given interval
+	// Configurable via FLUSH_INTERVAL_MS; default -1 for streaming downloads.
+	switch ms := config.Config.FlushIntervalMS; {
+	case ms < 0:
+		readProxy.FlushInterval = -1
+	case ms == 0:
+		// zero value: no periodic flushing
+	default:
+		readProxy.FlushInterval = time.Duration(ms) * time.Millisecond
+	}
+	slog.Info("Read proxy FlushInterval configured", "flushIntervalMS", config.Config.FlushIntervalMS)
 
 	// Application-layer BufferPool — controls the buffer size used by
 	// ReverseProxy's internal io.CopyBuffer. Using sync.Pool avoids a

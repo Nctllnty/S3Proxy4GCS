@@ -64,6 +64,7 @@ type Settings struct {
 	ReadBufferSize        int           // TCP read buffer size for read-path Transport
 	WriteBufferSize       int           // TCP write buffer size for write-path Transport
 	ProxyBufferSize       int           // Application-layer io.CopyBuffer size for ReverseProxy.BufferPool; 0 = Go default 32KB
+	FlushIntervalMS       int           // ReverseProxy FlushInterval for read proxy in ms; -1 = immediate, 0 = no flush, >0 = periodic
 	ProxyAccessKey        string        // Legacy single-key fallback (AK)
 	ProxySecretKey        string        // Legacy single-key fallback (SK)
 	JSONKey               string        // Path to GCS Service Account JSON key
@@ -214,6 +215,15 @@ func LoadConfig() {
 		}
 	}
 
+	flushIntervalMS := -1 // immediate flush by default (best TTFB)
+	if v, ok := os.LookupEnv("FLUSH_INTERVAL_MS"); ok && v != "" {
+		if n, err := strconv.Atoi(v); err != nil {
+			log.Printf("WARNING: invalid FLUSH_INTERVAL_MS value %q, using default -1", v)
+		} else {
+			flushIntervalMS = n // -1, 0, or positive ms are all valid
+		}
+	}
+
 	reqLogEnabled := getEnv("REQUEST_LOG_ENABLED", "true") == "true"
 	reqLogMaxSizeMB := 512
 	if v := getEnv("REQUEST_LOG_MAX_SIZE_MB", "512"); v != "" {
@@ -277,6 +287,7 @@ func LoadConfig() {
 		ReadBufferSize:            readBufferSize,
 		WriteBufferSize:           writeBufferSize,
 		ProxyBufferSize:           proxyBufferSize,
+		FlushIntervalMS:           flushIntervalMS,
 		ProxyAccessKey:            proxyAK,
 		ProxySecretKey:            proxySK,
 		HMACCredentials:           credsMap,
