@@ -63,6 +63,7 @@ type Settings struct {
 	ResponseHeaderTimeout time.Duration // Max wait for response headers from GCS
 	ReadBufferSize        int           // TCP read buffer size for read-path Transport
 	WriteBufferSize       int           // TCP write buffer size for write-path Transport
+	ProxyBufferSize       int           // Application-layer io.CopyBuffer size for ReverseProxy.BufferPool; 0 = Go default 32KB
 	ProxyAccessKey        string        // Legacy single-key fallback (AK)
 	ProxySecretKey        string        // Legacy single-key fallback (SK)
 	JSONKey               string        // Path to GCS Service Account JSON key
@@ -204,6 +205,15 @@ func LoadConfig() {
 		}
 	}
 
+	proxyBufferSize := 32768 // 32KB — matches Go's default io.Copy buffer
+	if v := getEnv("PROXY_BUFFER_SIZE", "32768"); v != "" {
+		if n, err := strconv.Atoi(v); err != nil {
+			log.Printf("WARNING: invalid PROXY_BUFFER_SIZE value %q, using default 32768", v)
+		} else if n > 0 {
+			proxyBufferSize = n
+		}
+	}
+
 	reqLogEnabled := getEnv("REQUEST_LOG_ENABLED", "true") == "true"
 	reqLogMaxSizeMB := 512
 	if v := getEnv("REQUEST_LOG_MAX_SIZE_MB", "512"); v != "" {
@@ -266,6 +276,7 @@ func LoadConfig() {
 		ResponseHeaderTimeout:     time.Duration(responseHeaderTimeoutSec) * time.Second,
 		ReadBufferSize:            readBufferSize,
 		WriteBufferSize:           writeBufferSize,
+		ProxyBufferSize:           proxyBufferSize,
 		ProxyAccessKey:            proxyAK,
 		ProxySecretKey:            proxySK,
 		HMACCredentials:           credsMap,

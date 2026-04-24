@@ -37,6 +37,7 @@ Available Configuration Options:
 -   `RESPONSE_HEADER_TIMEOUT_SEC` (Default: `30`): Maximum time to wait for GCS response headers. Protects against slow backend responses.
 -   `READ_BUFFER_SIZE` (Default: `65536`): TCP read buffer size (bytes) for the GET/HEAD read-path Transport. Larger values improve download throughput for large objects.
 -   `WRITE_BUFFER_SIZE` (Default: `65536`): TCP write buffer size (bytes) for the PUT/POST/DELETE write-path Transport. Larger values improve upload throughput for large objects.
+-   `PROXY_BUFFER_SIZE` (Default: `32768`): Application-layer buffer size (bytes) for `httputil.ReverseProxy.BufferPool`, controlling each `io.CopyBuffer` read/write chunk. Uses `sync.Pool` to reuse buffers and reduce GC pressure under high concurrency. Independent of the TCP-layer `READ_BUFFER_SIZE`/`WRITE_BUFFER_SIZE`. Try `131072` (128KB) for large-object throughput workloads.
 -   `PPROF_ADDR` (Default: empty / disabled): Bind address for the optional `net/http/pprof` profiling endpoint (e.g. `127.0.0.1:6060`). Uses a dedicated listener so runtime profiles never compete with or leak through the main data-plane port. Enable only for diagnostics.
 -   `RESTORE_SKIP_EXISTENCE_CHECK` (Default: `false`): Controls the GCS HEAD probe in the synthetic `RestoreObject` shim (see [Compatibility Shims](#compatibility-shims)). Leave at `false` so missing keys return `404 NoSuchKey`; set to `true` to save one Class B GCS call per `RestoreObject` when callers can tolerate deferred 404 discovery on the next `GetObject`.
 

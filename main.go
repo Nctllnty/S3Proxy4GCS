@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -195,6 +196,19 @@ func main() {
 
 	// Immediate flush on read proxy — reduces time-to-first-byte for GET/HEAD streaming.
 	readProxy.FlushInterval = -1
+
+	// Application-layer BufferPool — controls the buffer size used by
+	// ReverseProxy's internal io.CopyBuffer. Using sync.Pool avoids a
+	// per-request allocation and significantly reduces GC pressure under
+	// high concurrency. The default 32KB matches Go's built-in io.Copy;
+	// tune via PROXY_BUFFER_SIZE for large-object throughput workloads.
+	if config.Config.ProxyBufferSize > 0 {
+		pool := newProxyBufferPool(config.Config.ProxyBufferSize)
+		readProxy.BufferPool = pool
+		writeProxy.BufferPool = pool
+		slog.Info("ReverseProxy BufferPool enabled (sync.Pool)",
+			"bufferSize", config.Config.ProxyBufferSize)
+	}
 
 	// Shared Director and ModifyResponse applied to both proxies.
 	director := func(req *http.Request) {
@@ -579,6 +593,26 @@ func main() {
 // http.NewResponseController can walk through this wrapper to reach the
 // underlying http.Flusher. Without this, readProxy.FlushInterval = -1
 // silently fails and GET/HEAD streaming buffers at the proxy boundary.
+
+// proxyBufferPool implements httputil.BufferPool using sync.Pool to provide
+// reusable byte slices for ReverseProxy's internal io.CopyBuffer calls.
+// This eliminates per-request heap allocations and reduces GC pressure
+// under high concurrency. See PROXY_BUFFER_SIZE in config.
+type proxyBufferPool struct {
+	pool sync.Pool
+}
+
+func newProxyBufferPool(size int) *proxyBufferPool {
+	return &proxyBufferPool{
+		pool: sync.Pool{
+			New: func() any { return make([]byte, size) },
+		},
+	}
+}
+
+func (p *proxyBufferPool) Get() []byte  { return p.pool.Get().([]byte) }
+func (p *proxyBufferPool) Put(b []byte) { p.pool.Put(b) }
+
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
