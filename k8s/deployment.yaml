@@ -79,8 +79,11 @@ spec:
               value: "1000"
             - name: GCS_CALL_TIMEOUT_SEC
               value: "30"
-            - name: PROXY_BASE_DOMAIN
-              value: "s3proxy.lb.local"
+            # PROXY_BASE_DOMAIN is intentionally unset (default: disabled).
+            # Clients must configure path-style addressing explicitly. To
+            # re-enable virtual-hosted -> path-style rewriting on the
+            # server, set PROXY_BASE_DOMAIN to a wildcard-DNS base (e.g.
+            # s3proxy.lb.local) and ensure *.<base> resolves to the proxy.
             # ---- HMAC Credential Mapping (v1.7+) ----
             # The proxy re-signs each request with the client's own GCS HMAC
             # key pair. The mapping lives in the `s3proxy-hmac-credentials`
