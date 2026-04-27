@@ -88,10 +88,10 @@ func LoadEnv() (*Env, error) {
 func NewS3Client(t *testing.T, env *Env) *s3.S3 {
 	t.Helper()
 	sess, err := session.NewSession(&aws.Config{
-		Endpoint:                      aws.String(env.ProxyEndpoint),
-		Region:                        aws.String("us-east-1"),
-		Credentials:                   credentials.NewStaticCredentials(env.HMACAccess, env.HMACSecret, ""),
-		S3ForcePathStyle:              aws.Bool(true),
+		Endpoint:         aws.String(env.ProxyEndpoint),
+		Region:           aws.String("us-east-1"),
+		Credentials:      credentials.NewStaticCredentials(env.HMACAccess, env.HMACSecret, ""),
+		S3ForcePathStyle: aws.Bool(true),
 		// v1.8 default DISABLE_HEADER_STRIP=true: the proxy no longer
 		// rewrites streaming chunked uploads or strips Expect/MD5
 		// headers before re-signing. Disable them here so PutObject
@@ -118,6 +118,18 @@ func (t *stripSDKHeadersTransport) RoundTrip(req *http.Request) (*http.Response,
 	req.Header.Del("Amz-Sdk-Invocation-Id")
 	req.Header.Del("Amz-Sdk-Request")
 	req.Header.Del("Accept-Encoding")
+	if req.Method == http.MethodPut || req.Method == http.MethodPost {
+		fmt.Printf("[DEBUG] %s %s | X-Amz-Content-Sha256=%q Content-Length=%d Transfer-Encoding=%v Content-Encoding=%q X-Amz-Decoded-Content-Length=%q X-Amz-Trailer=%q Expect=%q\n",
+			req.Method, req.URL.Path,
+			req.Header.Get("X-Amz-Content-Sha256"),
+			req.ContentLength,
+			req.TransferEncoding,
+			req.Header.Get("Content-Encoding"),
+			req.Header.Get("X-Amz-Decoded-Content-Length"),
+			req.Header.Get("X-Amz-Trailer"),
+			req.Header.Get("Expect"),
+		)
+	}
 	return t.base.RoundTrip(req)
 }
 

@@ -58,6 +58,18 @@ def s3_client(env):
     def _strip_sdk_headers(request, **_):
         for h in ("amz-sdk-invocation-id", "amz-sdk-request", "accept-encoding"):
             request.headers.pop(h, None)
+        if request.method in ("PUT", "POST"):
+            print(
+                f"[DEBUG] {request.method} {request.url} | "
+                f"X-Amz-Content-Sha256={request.headers.get('X-Amz-Content-SHA256')!r} "
+                f"Content-Length={request.headers.get('Content-Length')!r} "
+                f"Transfer-Encoding={request.headers.get('Transfer-Encoding')!r} "
+                f"Content-Encoding={request.headers.get('Content-Encoding')!r} "
+                f"X-Amz-Decoded-Content-Length={request.headers.get('X-Amz-Decoded-Content-Length')!r} "
+                f"X-Amz-Trailer={request.headers.get('X-Amz-Trailer')!r} "
+                f"Expect={request.headers.get('Expect')!r}",
+                flush=True,
+            )
 
     client.meta.events.register("before-send.s3", _strip_sdk_headers)
     return client
