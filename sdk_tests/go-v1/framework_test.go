@@ -88,11 +88,17 @@ func LoadEnv() (*Env, error) {
 func NewS3Client(t *testing.T, env *Env) *s3.S3 {
 	t.Helper()
 	sess, err := session.NewSession(&aws.Config{
-		Endpoint:         aws.String(env.ProxyEndpoint),
-		Region:           aws.String("us-east-1"),
-		Credentials:      credentials.NewStaticCredentials(env.HMACAccess, env.HMACSecret, ""),
-		S3ForcePathStyle: aws.Bool(true),
-		HTTPClient:       &http.Client{Transport: &stripSDKHeadersTransport{base: http.DefaultTransport}},
+		Endpoint:                      aws.String(env.ProxyEndpoint),
+		Region:                        aws.String("us-east-1"),
+		Credentials:                   credentials.NewStaticCredentials(env.HMACAccess, env.HMACSecret, ""),
+		S3ForcePathStyle:              aws.Bool(true),
+		// v1.8 default DISABLE_HEADER_STRIP=true: the proxy no longer
+		// rewrites streaming chunked uploads or strips Expect/MD5
+		// headers before re-signing. Disable them here so PutObject
+		// sends plain sha256 payload that GCS XML API can verify.
+		S3DisableContentMD5Validation: aws.Bool(true),
+		S3Disable100Continue:          aws.Bool(true),
+		HTTPClient:                    &http.Client{Transport: &stripSDKHeadersTransport{base: http.DefaultTransport}},
 	})
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)

@@ -2,6 +2,14 @@
 import os
 import time
 
+# v1.8 default DISABLE_HEADER_STRIP=true: the proxy no longer rewrites
+# streaming chunked uploads or strips trailer checksums before
+# re-signing. Force boto3 to use plain sha256 payload (no trailer
+# checksum, no chunked body) so the GCS XML API can verify the
+# re-signed request directly. Must be set BEFORE botocore is imported.
+os.environ.setdefault("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
+os.environ.setdefault("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
+
 import boto3
 import pytest
 from botocore.config import Config

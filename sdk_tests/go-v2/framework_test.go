@@ -117,6 +117,13 @@ func NewS3Client(t *testing.T, env *Env) *s3.Client {
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.UsePathStyle = true
 		o.BaseEndpoint = aws.String(env.ProxyEndpoint)
+		// v1.8 default DISABLE_HEADER_STRIP=true: the proxy no longer
+		// rewrites streaming chunked uploads to plain sha256 before
+		// re-signing. Force PutObject to use a non-streaming payload
+		// (real sha256, no trailer checksum) so the GCS XML API can
+		// verify the re-signed request directly.
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		o.HTTPClient = &http.Client{
 			Transport: &stripSDKHeadersTransport{
 				base: &http.Transport{
