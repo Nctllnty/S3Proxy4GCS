@@ -118,15 +118,32 @@ func NewS3Client(t *testing.T, env *Env) *s3.Client {
 		o.UsePathStyle = true
 		o.BaseEndpoint = aws.String(env.ProxyEndpoint)
 		o.HTTPClient = &http.Client{
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
+			Transport: &stripSDKHeadersTransport{
+				base: &http.Transport{
+					MaxIdleConns:        100,
+					MaxIdleConnsPerHost: 100,
+					IdleConnTimeout:     90 * time.Second,
+				},
 			},
 			Timeout: 60 * time.Second,
 		}
 	})
 	return client
+}
+
+// stripSDKHeadersTransport removes AWS SDK diagnostic headers before the
+// request hits the proxy. Required when the proxy runs with
+// DISABLE_HEADER_STRIP=true (default since v1.8) because GCS XML API does
+// not accept Amz-Sdk-Invocation-Id / Amz-Sdk-Request in SignedHeaders.
+type stripSDKHeadersTransport struct {
+	base http.RoundTripper
+}
+
+func (t *stripSDKHeadersTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Del("Amz-Sdk-Invocation-Id")
+	req.Header.Del("Amz-Sdk-Request")
+	req.Header.Del("Accept-Encoding")
+	return t.base.RoundTrip(req)
 }
 
 func GenerateTestKey(env *Env, suffix string) string {

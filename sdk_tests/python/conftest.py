@@ -40,6 +40,18 @@ def s3_client(env):
             retries={"max_attempts": 3, "mode": "standard"},
         ),
     )
+
+    # Strip SDK diagnostic headers before they hit the proxy. Required
+    # when the proxy runs with DISABLE_HEADER_STRIP=true (default since
+    # v1.8) because GCS XML API does not accept Amz-Sdk-Invocation-Id /
+    # Amz-Sdk-Request in SignedHeaders. before-send fires after boto3
+    # has signed the request, so deleting these headers here keeps the
+    # signature aligned with what GCS will verify.
+    def _strip_sdk_headers(request, **_):
+        for h in ("amz-sdk-invocation-id", "amz-sdk-request", "accept-encoding"):
+            request.headers.pop(h, None)
+
+    client.meta.events.register("before-send.s3", _strip_sdk_headers)
     return client
 
 

@@ -92,11 +92,27 @@ func NewS3Client(t *testing.T, env *Env) *s3.S3 {
 		Region:           aws.String("us-east-1"),
 		Credentials:      credentials.NewStaticCredentials(env.HMACAccess, env.HMACSecret, ""),
 		S3ForcePathStyle: aws.Bool(true),
+		HTTPClient:       &http.Client{Transport: &stripSDKHeadersTransport{base: http.DefaultTransport}},
 	})
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
 	return s3.New(sess)
+}
+
+// stripSDKHeadersTransport removes AWS SDK diagnostic headers before the
+// request hits the proxy. Required when the proxy runs with
+// DISABLE_HEADER_STRIP=true (default since v1.8) because GCS XML API does
+// not accept Amz-Sdk-Invocation-Id / Amz-Sdk-Request in SignedHeaders.
+type stripSDKHeadersTransport struct {
+	base http.RoundTripper
+}
+
+func (t *stripSDKHeadersTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Del("Amz-Sdk-Invocation-Id")
+	req.Header.Del("Amz-Sdk-Request")
+	req.Header.Del("Accept-Encoding")
+	return t.base.RoundTrip(req)
 }
 
 func GenerateTestKey(env *Env, suffix string) string {
