@@ -117,52 +117,23 @@ func NewS3Client(t *testing.T, env *Env) *s3.Client {
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.UsePathStyle = true
 		o.BaseEndpoint = aws.String(env.ProxyEndpoint)
-		// v1.8 default DISABLE_HEADER_STRIP=true: the proxy no longer
-		// rewrites streaming chunked uploads to plain sha256 before
-		// re-signing. Force PutObject to use a non-streaming payload
-		// (real sha256, no trailer checksum) so the GCS XML API can
-		// verify the re-signed request directly.
+		// Force PutObject to use a non-streaming payload (real sha256,
+		// no trailer checksum) so the GCS XML API can verify the
+		// re-signed request. Without these flags the SDK may wrap the
+		// body with STREAMING-UNSIGNED-PAYLOAD-TRAILER, which GCS does
+		// not accept.
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		o.HTTPClient = &http.Client{
-			Transport: &stripSDKHeadersTransport{
-				base: &http.Transport{
-					MaxIdleConns:        100,
-					MaxIdleConnsPerHost: 100,
-					IdleConnTimeout:     90 * time.Second,
-				},
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
 			},
 			Timeout: 60 * time.Second,
 		}
 	})
 	return client
-}
-
-// stripSDKHeadersTransport removes AWS SDK diagnostic headers before the
-// request hits the proxy. Required when the proxy runs with
-// DISABLE_HEADER_STRIP=true (default since v1.8) because GCS XML API does
-// not accept Amz-Sdk-Invocation-Id / Amz-Sdk-Request in SignedHeaders.
-type stripSDKHeadersTransport struct {
-	base http.RoundTripper
-}
-
-func (t *stripSDKHeadersTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Del("Amz-Sdk-Invocation-Id")
-	req.Header.Del("Amz-Sdk-Request")
-	req.Header.Del("Accept-Encoding")
-	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		fmt.Printf("[DEBUG] %s %s | X-Amz-Content-Sha256=%q Content-Length=%d Transfer-Encoding=%v Content-Encoding=%q X-Amz-Decoded-Content-Length=%q X-Amz-Trailer=%q Expect=%q\n",
-			req.Method, req.URL.Path,
-			req.Header.Get("X-Amz-Content-Sha256"),
-			req.ContentLength,
-			req.TransferEncoding,
-			req.Header.Get("Content-Encoding"),
-			req.Header.Get("X-Amz-Decoded-Content-Length"),
-			req.Header.Get("X-Amz-Trailer"),
-			req.Header.Get("Expect"),
-		)
-	}
-	return t.base.RoundTrip(req)
 }
 
 func GenerateTestKey(env *Env, suffix string) string {

@@ -4,6 +4,45 @@ All notable changes to the s3proxy4gcs project are documented in this file.
 Dates are in ISO-8601. Versions follow semver; log/metric label changes are
 listed under "Breaking (observability)" so downstream dashboards can adapt.
 
+## v2.0.1 — Multi-SDK re-sign fix: unconditional header strip (2026-04-18)
+
+### Fixed
+- **Object-level requests were failing with `SignatureDoesNotMatch`** for
+  every modern AWS SDK (Go V2, Go V1, Python/boto3, Java V1, Java V2)
+  whenever the proxy re-signed a data-plane request. Root cause
+  (confirmed from GCS `<CanonicalRequest>` error body):
+  - Go's stdlib `http.Transport` automatically adds
+    `Accept-Encoding: gzip` right before writing the request on the
+    wire, bypassing any client-side `Header.Del`. Google's front-end
+    then rewrites the value to `gzip,gzip(gfe)`. The value signed by
+    the proxy, the value sent on the wire, and the value GCS finally
+    sees are three different strings.
+  - `Amz-Sdk-Invocation-Id` and `Amz-Sdk-Request` are generated deep
+    inside the AWS SDK middleware chain and similarly escape
+    client-side strip attempts.
+  These three headers always end up in the SigV4 `SignedHeaders`
+  list when the SDK signs the request, so GCS deterministically
+  rejects them with 403.
+- Bucket-level control-plane requests (lifecycle/CORS/logging/
+  website/tagging) still worked because they are handled by
+  internal translators (GCS JSON API + Workload Identity) and never
+  hit the SigV4 re-sign path.
+- The proxy Director now **unconditionally** deletes
+  `Accept-Encoding`, `Amz-Sdk-Invocation-Id`, `Amz-Sdk-Request`
+  immediately before `SignHTTP`, regardless of
+  `DISABLE_HEADER_STRIP`. The remaining SDK-diagnostic headers
+  (`X-Amz-Decoded-Content-Length`, `X-Amz-Trailer`,
+  `Content-Encoding: aws-chunked`) keep their existing behaviour
+  behind the flag.
+
+### Changed
+- Simplified Go V2 / Go V1 / Python SDK test harnesses: the
+  client-side `stripSDKHeadersTransport` / `before-send.s3`
+  shim is no longer required — the proxy now handles these
+  headers for every client. Client configuration is back to the
+  SDK-defaults-plus-path-style baseline plus the checksum /
+  100-continue / MD5 switches documented in the README.
+
 ## v2.0.0 — Per-client HMAC credential mapping & production hardening (2026-04-18)
 
 ### Added

@@ -284,19 +284,21 @@ The proxy has been validated against **6 AWS SDKs** (Go V2, Go V1, Python/boto3,
 
 ### Proxy-Side Header Stripping (Automatic)
 
-The proxy Director automatically strips the following headers before SigV4 re-signing. **No user action is required** — this is handled transparently:
+The proxy Director automatically strips the following headers before SigV4 re-signing. **No user action is required** — this is handled transparently.
 
-| Header | Source SDK | Why Stripped |
-|---|---|---|
-| `User-Agent` | All | AWS-format UA included in signature but not expected by GCS |
-| `Content-Md5` | Go V1, Java V1 | Stripped by default (SDK-computed MD5 invalidated after re-signing); **exception: `POST ?delete` — proxy recomputes MD5 from body** (GCS requires `Content-MD5` or `x-amz-checksum-*` for bulk delete) |
-| `Expect` | Go V1 | `100-continue` interferes with GCS signature verification |
-| `Accept-Encoding` | Go V2 | Go V2 gzip middleware sends `identity`, GCS modifies in transport causing canonical request mismatch |
-| `Amz-Sdk-Invocation-Id` | Java V1/V2 | AWS internal tracking ID, not recognized by GCS |
-| `Amz-Sdk-Request` | Java V1/V2 | AWS retry metadata, not recognized by GCS |
-| `X-Amz-Decoded-Content-Length` | Java V1/V2 | aws-chunked related, meaningless after decode |
-| `X-Amz-Trailer` | Java V2 | Flexible Checksums trailer declaration |
-| `Content-Encoding` (aws-chunked) | Java V1/V2 | Conditionally removed when value contains `aws-chunked` |
+Three of them (`Accept-Encoding`, `Amz-Sdk-Invocation-Id`, `Amz-Sdk-Request`) are removed *unconditionally* since **v2.0.1**: they either get injected back by Go's stdlib `http.Transport` / Google front-end after the client’s own strip (`Accept-Encoding: gzip`→`gzip,gzip(gfe)`) or generated deep in the AWS SDK middleware (`Amz-Sdk-*`), so clients cannot reliably keep them out of `SignedHeaders`. Letting the proxy strip them right before `SignHTTP` is the only way to keep the re-signed canonical request aligned with what GCS actually sees.
+
+| Header | Source SDK | Strip Policy | Why |
+|---|---|---|---|
+| `User-Agent` | All | Always | AWS-format UA included in signature but not expected by GCS |
+| `Content-Md5` | Go V1, Java V1 | Always (except `POST ?delete`: proxy recomputes from body) | SDK-computed MD5 is invalidated after re-signing; GCS requires MD5/checksum for bulk delete |
+| `Expect` | Go V1 | Always | `100-continue` interferes with GCS signature verification |
+| `Accept-Encoding` | Go / Java / C++ (all) | **Unconditional** | Go stdlib auto-adds `gzip`; Google front-end rewrites to `gzip,gzip(gfe)`; clients cannot prevent it |
+| `Amz-Sdk-Invocation-Id` | Go V2, Java V1/V2 | **Unconditional** | Injected by AWS SDK middleware after the user-level transport; not recognised by GCS |
+| `Amz-Sdk-Request` | Go V2, Java V1/V2 | **Unconditional** | Same reason as above |
+| `X-Amz-Decoded-Content-Length` | Java V1/V2 | When `DISABLE_HEADER_STRIP=false` | aws-chunked related, meaningless after decode |
+| `X-Amz-Trailer` | Java V2 | When `DISABLE_HEADER_STRIP=false` | Flexible Checksums trailer declaration |
+| `Content-Encoding` (aws-chunked) | Java V1/V2 | When `DISABLE_HEADER_STRIP=false` *and* value contains `aws-chunked` | The chunked framing itself is still rejected at `handleS3Request` entry |
 
 ### Virtual-Hosted Style Support
 
@@ -311,31 +313,44 @@ When `PROXY_BASE_DOMAIN` is not set (default), this feature is disabled and all 
 
 ### Per-SDK Client Configuration
 
-#### Go V2 — Zero configuration
+#### Go V2 — Disable Flexible Checksums
 
 ```go
 client := s3.NewFromConfig(cfg, func(o *s3.Options) {
     o.BaseEndpoint = aws.String("http://PROXY_ENDPOINT")
+    // Prevent the SDK from wrapping PutObject bodies with
+    // STREAMING-UNSIGNED-PAYLOAD-TRAILER, which GCS does not accept.
+    o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+    o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 })
 ```
 
 > With `PROXY_BASE_DOMAIN` enabled, no path-style needed. Without it, add `o.UsePathStyle = true`.
 
-#### Go V1 — Zero configuration
+#### Go V1 — Disable Content-MD5 and 100-continue
 
 ```go
 sess, _ := session.NewSession(&aws.Config{
     Endpoint:    aws.String("http://PROXY_ENDPOINT"),
     Region:      aws.String("us-east-1"),
     Credentials: credentials.NewStaticCredentials(access, secret, ""),
+    // Without these two switches Go V1 may add `Expect: 100-continue`
+    // and `Content-MD5`, both of which break after proxy re-signing.
+    S3DisableContentMD5Validation: aws.Bool(true),
+    S3Disable100Continue:          aws.Bool(true),
 })
 ```
 
 > With `PROXY_BASE_DOMAIN` enabled, no path-style needed. Without it, add `S3ForcePathStyle: aws.Bool(true)`.
 
-#### Python (boto3) — Zero configuration
+#### Python (boto3) — Disable Flexible Checksums via env vars
 
 ```python
+import os
+os.environ.setdefault("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
+os.environ.setdefault("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
+
+import boto3
 client = boto3.client(
     "s3",
     endpoint_url="http://PROXY_ENDPOINT",
@@ -345,7 +360,7 @@ client = boto3.client(
 )
 ```
 
-> With `PROXY_BASE_DOMAIN` enabled, no path-style needed. Without it, add `config=Config(s3={"addressing_style": "path"})`.
+> Env vars **must** be set before `boto3`/`botocore` is imported. With `PROXY_BASE_DOMAIN` enabled, no path-style needed. Without it, add `config=Config(s3={"addressing_style": "path"})`.
 
 #### Java V1 — Disable chunked encoding
 

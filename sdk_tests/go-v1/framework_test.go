@@ -92,45 +92,18 @@ func NewS3Client(t *testing.T, env *Env) *s3.S3 {
 		Region:           aws.String("us-east-1"),
 		Credentials:      credentials.NewStaticCredentials(env.HMACAccess, env.HMACSecret, ""),
 		S3ForcePathStyle: aws.Bool(true),
-		// v1.8 default DISABLE_HEADER_STRIP=true: the proxy no longer
-		// rewrites streaming chunked uploads or strips Expect/MD5
-		// headers before re-signing. Disable them here so PutObject
-		// sends plain sha256 payload that GCS XML API can verify.
+		// Disable MD5 validation and the 100-continue handshake so the
+		// SDK sends a plain sha256 payload that GCS XML API can verify
+		// after proxy re-signing. Without these, Go V1 may add Expect:
+		// 100-continue and Content-MD5 headers that either confuse GCS
+		// or mismatch after re-signing.
 		S3DisableContentMD5Validation: aws.Bool(true),
 		S3Disable100Continue:          aws.Bool(true),
-		HTTPClient:                    &http.Client{Transport: &stripSDKHeadersTransport{base: http.DefaultTransport}},
 	})
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
 	return s3.New(sess)
-}
-
-// stripSDKHeadersTransport removes AWS SDK diagnostic headers before the
-// request hits the proxy. Required when the proxy runs with
-// DISABLE_HEADER_STRIP=true (default since v1.8) because GCS XML API does
-// not accept Amz-Sdk-Invocation-Id / Amz-Sdk-Request in SignedHeaders.
-type stripSDKHeadersTransport struct {
-	base http.RoundTripper
-}
-
-func (t *stripSDKHeadersTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Del("Amz-Sdk-Invocation-Id")
-	req.Header.Del("Amz-Sdk-Request")
-	req.Header.Del("Accept-Encoding")
-	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		fmt.Printf("[DEBUG] %s %s | X-Amz-Content-Sha256=%q Content-Length=%d Transfer-Encoding=%v Content-Encoding=%q X-Amz-Decoded-Content-Length=%q X-Amz-Trailer=%q Expect=%q\n",
-			req.Method, req.URL.Path,
-			req.Header.Get("X-Amz-Content-Sha256"),
-			req.ContentLength,
-			req.TransferEncoding,
-			req.Header.Get("Content-Encoding"),
-			req.Header.Get("X-Amz-Decoded-Content-Length"),
-			req.Header.Get("X-Amz-Trailer"),
-			req.Header.Get("Expect"),
-		)
-	}
-	return t.base.RoundTrip(req)
 }
 
 func GenerateTestKey(env *Env, suffix string) string {

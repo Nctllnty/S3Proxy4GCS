@@ -2,11 +2,9 @@
 import os
 import time
 
-# v1.8 default DISABLE_HEADER_STRIP=true: the proxy no longer rewrites
-# streaming chunked uploads or strips trailer checksums before
-# re-signing. Force boto3 to use plain sha256 payload (no trailer
-# checksum, no chunked body) so the GCS XML API can verify the
-# re-signed request directly. Must be set BEFORE botocore is imported.
+# Force boto3 to use a plain sha256 payload (no trailer checksum, no
+# chunked body) so the GCS XML API can verify the re-signed request
+# directly. Must be set BEFORE botocore is imported.
 os.environ.setdefault("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
 os.environ.setdefault("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
 
@@ -37,7 +35,7 @@ def env():
 @pytest.fixture(scope="session")
 def s3_client(env):
     """Create an S3 client pointing at the proxy."""
-    client = boto3.client(
+    return boto3.client(
         "s3",
         endpoint_url=env["proxy_endpoint"],
         aws_access_key_id=env["hmac_access"],
@@ -48,31 +46,6 @@ def s3_client(env):
             retries={"max_attempts": 3, "mode": "standard"},
         ),
     )
-
-    # Strip SDK diagnostic headers before they hit the proxy. Required
-    # when the proxy runs with DISABLE_HEADER_STRIP=true (default since
-    # v1.8) because GCS XML API does not accept Amz-Sdk-Invocation-Id /
-    # Amz-Sdk-Request in SignedHeaders. before-send fires after boto3
-    # has signed the request, so deleting these headers here keeps the
-    # signature aligned with what GCS will verify.
-    def _strip_sdk_headers(request, **_):
-        for h in ("amz-sdk-invocation-id", "amz-sdk-request", "accept-encoding"):
-            request.headers.pop(h, None)
-        if request.method in ("PUT", "POST"):
-            print(
-                f"[DEBUG] {request.method} {request.url} | "
-                f"X-Amz-Content-Sha256={request.headers.get('X-Amz-Content-SHA256')!r} "
-                f"Content-Length={request.headers.get('Content-Length')!r} "
-                f"Transfer-Encoding={request.headers.get('Transfer-Encoding')!r} "
-                f"Content-Encoding={request.headers.get('Content-Encoding')!r} "
-                f"X-Amz-Decoded-Content-Length={request.headers.get('X-Amz-Decoded-Content-Length')!r} "
-                f"X-Amz-Trailer={request.headers.get('X-Amz-Trailer')!r} "
-                f"Expect={request.headers.get('Expect')!r}",
-                flush=True,
-            )
-
-    client.meta.events.register("before-send.s3", _strip_sdk_headers)
-    return client
 
 
 @pytest.fixture(scope="session")
