@@ -337,21 +337,29 @@ func main() {
 			payloadHash := "UNSIGNED-PAYLOAD"
 			req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-			// Re-sign with UNSIGNED-PAYLOAD and, for a select set of SDK-specific
-			// hop-by-hop headers, remove them before signing so the signature stays
-			// valid end-to-end. The SDK-diagnostic set (Amz-Sdk-*, Accept-Encoding,
-			// X-Amz-Decoded-Content-Length, X-Amz-Trailer, aws-chunked) is ONLY
-			// stripped when DISABLE_HEADER_STRIP=false (legacy mode). Default
-			// (true) is pass-through: clients are responsible for not sending
-			// those headers. See docs/sdk-client-config.md.
+			// Unconditionally strip headers that MUST NOT appear in the
+			// canonical request we sign for GCS. These three are special:
+			//
+			//   * Accept-Encoding  — Go's stdlib http.Transport auto-adds
+			//     `Accept-Encoding: gzip` when the caller did not set it,
+			//     and Google's front-end rewrites the value on the wire to
+			//     `gzip,gzip(gfe)`. Either way the value reaching GCS is
+			//     not the one we signed → SignatureDoesNotMatch.
+			//   * Amz-Sdk-Invocation-Id / Amz-Sdk-Request — added by the
+			//     AWS SDK v2 middleware chain and known to be stripped or
+			//     rewritten by Go's client transport in some code paths.
+			//
+			// Clients cannot reliably prevent these from reaching the
+			// proxy (see docs/sdk-client-config.md), so the proxy removes
+			// them right before signing regardless of DISABLE_HEADER_STRIP.
 			req.Header.Del("User-Agent")
 			req.Header.Del("Expect")
+			req.Header.Del("Accept-Encoding")
+			req.Header.Del("Amz-Sdk-Invocation-Id")
+			req.Header.Del("Amz-Sdk-Request")
 			if !config.Config.DisableHeaderStrip {
-				req.Header.Del("Amz-Sdk-Invocation-Id")
-				req.Header.Del("Amz-Sdk-Request")
 				req.Header.Del("X-Amz-Decoded-Content-Length")
 				req.Header.Del("X-Amz-Trailer")
-				req.Header.Del("Accept-Encoding")
 				if ce := req.Header.Get("Content-Encoding"); strings.Contains(ce, "aws-chunked") {
 					req.Header.Del("Content-Encoding")
 				}
