@@ -415,10 +415,21 @@ func main() {
 		// and wastes allocations on the hot path. The status code and URL
 		// are enough; detailed error bodies are visible to clients anyway.
 		if resp.StatusCode >= 400 {
+			// DEBUG (temporary): dump GCS error body to diagnose
+			// SignatureDoesNotMatch on the re-sign path.
+			var dbgBody string
+			if config.Config.DebugLogging && resp.Body != nil {
+				var buf bytes.Buffer
+				_, _ = io.Copy(&buf, io.LimitReader(resp.Body, 8192))
+				_ = resp.Body.Close()
+				dbgBody = buf.String()
+				resp.Body = io.NopCloser(&buf)
+			}
 			slog.Warn("GCS returned error",
 				"status", resp.StatusCode,
 				"method", resp.Request.Method,
 				"url", resp.Request.URL.String(),
+				"body", dbgBody,
 			)
 		}
 

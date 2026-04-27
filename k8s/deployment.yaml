@@ -70,7 +70,7 @@ spec:
             # metadata) for every request. Must remain "false" in production.
             # Set to "true" temporarily only when diagnosing signature issues.
             - name: DEBUG_LOGGING
-              value: "false"
+              value: "true"
             - name: MAX_IDLE_CONNS
               value: "1000"
             - name: MAX_IDLE_CONNS_PER_HOST
