@@ -304,7 +304,7 @@ func main() {
 		}
 
 		// Detect Accept-Encoding: identity (causes issues with GCS S3 API)
-		if req.Header.Get("Accept-Encoding") == "identity" {
+		if !config.Config.DisableHeaderStrip && req.Header.Get("Accept-Encoding") == "identity" {
 			if config.Config.DebugLogging {
 				slog.Debug("Detected Accept-Encoding: identity. Stripping and re-signing")
 			}
@@ -338,15 +338,21 @@ func main() {
 			req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
 			// Strip headers that interfere with GCS HMAC signature verification.
+			// Gated by DISABLE_HEADER_STRIP so SDK compatibility experiments can
+			// observe which clients break when these headers are forwarded to GCS.
 			req.Header.Del("User-Agent")
 			req.Header.Del("Expect")
-			req.Header.Del("Amz-Sdk-Invocation-Id")
-			req.Header.Del("Amz-Sdk-Request")
-			req.Header.Del("X-Amz-Decoded-Content-Length")
-			req.Header.Del("X-Amz-Trailer")
-			req.Header.Del("Accept-Encoding")
-			if ce := req.Header.Get("Content-Encoding"); strings.Contains(ce, "aws-chunked") {
-				req.Header.Del("Content-Encoding")
+			if !config.Config.DisableHeaderStrip {
+				req.Header.Del("Amz-Sdk-Invocation-Id")
+				req.Header.Del("Amz-Sdk-Request")
+				req.Header.Del("X-Amz-Decoded-Content-Length")
+				req.Header.Del("X-Amz-Trailer")
+				req.Header.Del("Accept-Encoding")
+				if ce := req.Header.Get("Content-Encoding"); strings.Contains(ce, "aws-chunked") {
+					req.Header.Del("Content-Encoding")
+				}
+			} else if config.Config.DebugLogging {
+				slog.Debug("DISABLE_HEADER_STRIP=true — forwarding SDK-diagnostic headers to GCS (expect 403 on most AWS SDKs)")
 			}
 
 			// For POST ?delete (DeleteObjects), GCS requires Content-MD5.
@@ -574,6 +580,9 @@ func main() {
 
 	go func() {
 		slog.Info("Starting S3 to GCS proxy", "port", config.Config.Port)
+		if config.Config.DisableHeaderStrip {
+			slog.Warn("DISABLE_HEADER_STRIP=true — Director will forward SDK-diagnostic headers (Amz-Sdk-*, Accept-Encoding, aws-chunked) to GCS. Most AWS SDKs will receive 403 SignatureDoesNotMatch. This flag is intended for SDK compatibility experiments only.")
+		}
 		serverErrors <- srv.ListenAndServe()
 	}()
 

@@ -70,6 +70,15 @@ type Settings struct {
 	JSONKey               string        // Path to GCS Service Account JSON key
 	ProxyBaseDomain       string        // Base domain for virtual-hosted style support
 
+	// DisableHeaderStrip disables the Director's removal of SDK-diagnostic
+	// headers (Accept-Encoding, Amz-Sdk-Invocation-Id, Amz-Sdk-Request,
+	// X-Amz-Decoded-Content-Length, X-Amz-Trailer, Content-Encoding:
+	// aws-chunked) before re-signing. Default false: strip is enabled for
+	// GCS compatibility. Set DISABLE_HEADER_STRIP=true ONLY for SDK
+	// compatibility experiments — most AWS SDKs will receive
+	// 403 SignatureDoesNotMatch when this is on.
+	DisableHeaderStrip bool
+
 	// HMACCredentials is the in-memory AK→SK mapping used by the Director
 	// to re-sign each inbound request with the client's own credentials.
 	// Populated from HMAC_CREDENTIALS (inline JSON), HMAC_CREDENTIALS_FILE
@@ -295,6 +304,7 @@ func LoadConfig() {
 		HMACStrict:                hmacStrict,
 		JSONKey:                   getEnv("JSON_KEY", ""),
 		ProxyBaseDomain:           getEnv("PROXY_BASE_DOMAIN", ""),
+		DisableHeaderStrip:        getEnvBool("DISABLE_HEADER_STRIP", false),
 		PPROFAddr:                 getEnv("PPROF_ADDR", ""),
 		RestoreSkipExistenceCheck: getEnv("RESTORE_SKIP_EXISTENCE_CHECK", "false") == "true",
 		ReqLogEnabled:             reqLogEnabled,
