@@ -81,14 +81,6 @@ spec:
               value: "30"
             - name: PROXY_BASE_DOMAIN
               value: "s3proxy.lb.local"
-            # ---- SDK Compatibility Experiment (branch: test/disable-header-strip) ----
-            # When true, the Director forwards SDK-diagnostic headers
-            # (Amz-Sdk-Invocation-Id, Amz-Sdk-Request, Accept-Encoding,
-            # X-Amz-Decoded-Content-Length, X-Amz-Trailer, aws-chunked
-            # Content-Encoding) to GCS untouched. Expect 403 on most AWS
-            # SDK v2 flavours. MUST remain "false" on main.
-            - name: DISABLE_HEADER_STRIP
-              value: "true"
             # ---- HMAC Credential Mapping (v1.7+) ----
             # The proxy re-signs each request with the client's own GCS HMAC
             # key pair. The mapping lives in the `s3proxy-hmac-credentials`

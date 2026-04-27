@@ -337,9 +337,13 @@ func main() {
 			payloadHash := "UNSIGNED-PAYLOAD"
 			req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-			// Strip headers that interfere with GCS HMAC signature verification.
-			// Gated by DISABLE_HEADER_STRIP so SDK compatibility experiments can
-			// observe which clients break when these headers are forwarded to GCS.
+			// Re-sign with UNSIGNED-PAYLOAD and, for a select set of SDK-specific
+			// hop-by-hop headers, remove them before signing so the signature stays
+			// valid end-to-end. The SDK-diagnostic set (Amz-Sdk-*, Accept-Encoding,
+			// X-Amz-Decoded-Content-Length, X-Amz-Trailer, aws-chunked) is ONLY
+			// stripped when DISABLE_HEADER_STRIP=false (legacy mode). Default
+			// (true) is pass-through: clients are responsible for not sending
+			// those headers. See docs/sdk-client-config.md.
 			req.Header.Del("User-Agent")
 			req.Header.Del("Expect")
 			if !config.Config.DisableHeaderStrip {
@@ -351,8 +355,6 @@ func main() {
 				if ce := req.Header.Get("Content-Encoding"); strings.Contains(ce, "aws-chunked") {
 					req.Header.Del("Content-Encoding")
 				}
-			} else if config.Config.DebugLogging {
-				slog.Debug("DISABLE_HEADER_STRIP=true — forwarding SDK-diagnostic headers to GCS (expect 403 on most AWS SDKs)")
 			}
 
 			// For POST ?delete (DeleteObjects), GCS requires Content-MD5.
@@ -579,9 +581,9 @@ func main() {
 	}
 
 	go func() {
-		slog.Info("Starting S3 to GCS proxy", "port", config.Config.Port)
-		if config.Config.DisableHeaderStrip {
-			slog.Warn("DISABLE_HEADER_STRIP=true — Director will forward SDK-diagnostic headers (Amz-Sdk-*, Accept-Encoding, aws-chunked) to GCS. Most AWS SDKs will receive 403 SignatureDoesNotMatch. This flag is intended for SDK compatibility experiments only.")
+		slog.Info("Starting S3 to GCS proxy", "port", config.Config.Port, "disable_header_strip", config.Config.DisableHeaderStrip)
+		if !config.Config.DisableHeaderStrip {
+			slog.Warn("DISABLE_HEADER_STRIP=false — Director will strip SDK-diagnostic headers (Amz-Sdk-*, Accept-Encoding, aws-chunked) before re-signing. This is the legacy behaviour; default since v1.8 is true (clients handle their own headers).")
 		}
 		serverErrors <- srv.ListenAndServe()
 	}()

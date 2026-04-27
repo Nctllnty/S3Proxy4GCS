@@ -73,10 +73,12 @@ type Settings struct {
 	// DisableHeaderStrip disables the Director's removal of SDK-diagnostic
 	// headers (Accept-Encoding, Amz-Sdk-Invocation-Id, Amz-Sdk-Request,
 	// X-Amz-Decoded-Content-Length, X-Amz-Trailer, Content-Encoding:
-	// aws-chunked) before re-signing. Default false: strip is enabled for
-	// GCS compatibility. Set DISABLE_HEADER_STRIP=true ONLY for SDK
-	// compatibility experiments — most AWS SDKs will receive
-	// 403 SignatureDoesNotMatch when this is on.
+	// aws-chunked) before re-signing. Default true since v1.8: the proxy
+	// is a transparent pass-through and clients are responsible for not
+	// sending headers GCS cannot verify. See docs/sdk-client-config.md for
+	// the per-SDK workarounds (Go V2 / Go V1 / boto3 need explicit header
+	// scrubbing; Java V1/V2 and C++ work out of the box). Set to false
+	// only when re-enabling the legacy server-side strip behaviour.
 	DisableHeaderStrip bool
 
 	// HMACCredentials is the in-memory AK→SK mapping used by the Director
@@ -304,7 +306,7 @@ func LoadConfig() {
 		HMACStrict:                hmacStrict,
 		JSONKey:                   getEnv("JSON_KEY", ""),
 		ProxyBaseDomain:           getEnv("PROXY_BASE_DOMAIN", ""),
-		DisableHeaderStrip:        getEnvBool("DISABLE_HEADER_STRIP", false),
+		DisableHeaderStrip:        getEnvBool("DISABLE_HEADER_STRIP", true),
 		PPROFAddr:                 getEnv("PPROF_ADDR", ""),
 		RestoreSkipExistenceCheck: getEnv("RESTORE_SKIP_EXISTENCE_CHECK", "false") == "true",
 		ReqLogEnabled:             reqLogEnabled,
