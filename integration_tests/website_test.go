@@ -69,7 +69,7 @@ func TestPutWebsiteWithAWSSDK(t *testing.T) {
 
 	// 2. Prepare Website Configuration
 	input := &s3.PutBucketWebsiteInput{
-		Bucket: aws.String("test-website-bucket"),
+		Bucket: aws.String(getTestBucket()),
 		WebsiteConfiguration: &types.WebsiteConfiguration{
 			IndexDocument: &types.IndexDocument{
 				Suffix: aws.String("index.html"),

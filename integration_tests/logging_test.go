@@ -69,10 +69,10 @@ func TestPutLoggingWithAWSSDK(t *testing.T) {
 
 	// 2. Prepare Bucket Logging Configuration
 	input := &s3.PutBucketLoggingInput{
-		Bucket: aws.String("test-logging-bucket"),
+		Bucket: aws.String(getTestBucket()),
 		BucketLoggingStatus: &types.BucketLoggingStatus{
 			LoggingEnabled: &types.LoggingEnabled{
-				TargetBucket: aws.String("target-log-bucket"),
+				TargetBucket: aws.String(integrationLogTargetBucket),
 				TargetPrefix: aws.String("logs/"),
 			},
 		},
@@ -86,7 +86,7 @@ func TestPutLoggingWithAWSSDK(t *testing.T) {
 
 	t.Logf("Sending GetBucketLogging via standard AWS S3 SDK Go...")
 	getOut, err := client.GetBucketLogging(context.TODO(), &s3.GetBucketLoggingInput{
-		Bucket: aws.String("test-logging-bucket"),
+		Bucket: aws.String(getTestBucket()),
 	})
 	if err != nil {
 		t.Fatalf("Failed to execute GetBucketLogging: %v", err)

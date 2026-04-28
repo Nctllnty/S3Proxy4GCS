@@ -104,9 +104,9 @@ jobs:
           kubectl create secret generic s3proxy-hmac-credentials \
             --from-literal=credentials.json="${CREDENTIALS_JSON}" \
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create secret generic s3proxy-config \
-            --from-literal=TARGET_BUCKET=${{ secrets.TEST_BUCKET }} \
-            -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          # s3proxy-config Secret no longer carries TARGET_BUCKET: the proxy
+          # runs in multi-tenant mode (bucket parsed per-request from URL) and
+          # the benchmark harness hard-codes `s3proxy-e2e-test`.
 
           # Pin S3Proxy to the selected node pool (single-value nodeAffinity).
           # Use placeholder to avoid sed deleting the line we just wrote

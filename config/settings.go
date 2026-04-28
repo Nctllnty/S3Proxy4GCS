@@ -321,7 +321,9 @@ func LoadConfig() {
 	// Validate required fields for non-DryRun mode
 	if !dryRun {
 		if Config.TargetBucket == "" {
-			log.Fatal("FATAL: TARGET_BUCKET is required when DRY_RUN=false")
+			slog.Info("TARGET_BUCKET not set; control-plane handlers will parse bucket from request URL (multi-tenant mode). Warmup and /readyz active probing are disabled.")
+		} else {
+			slog.Info("TARGET_BUCKET configured as warmup / readyz probe hint", "bucket", Config.TargetBucket)
 		}
 		if Config.GCPProjectID == "" {
 			log.Println("WARNING: GCP_PROJECT_ID is empty, some GCS operations may fail")

@@ -26,6 +26,12 @@ type Env struct {
 	TestPrefix    string // e.g. "e2e-12345/" for run isolation
 }
 
+// e2eTestBucket is the real GCS bucket dedicated to E2E acceptance tests
+// (functional / stability / benchmark). Provisioned once in project
+// `cbs-poctest` (US-EAST1) and hard-coded here — no TEST_BUCKET env
+// indirection so the test suite owns an isolated bucket.
+const e2eTestBucket = "s3proxy-e2e-test"
+
 // LoadEnv reads and validates required environment variables.
 // It calls t.Fatal (or log.Fatal in TestMain) if any required var is missing.
 func LoadEnv() (*Env, error) {
@@ -33,7 +39,7 @@ func LoadEnv() (*Env, error) {
 		ProxyEndpoint: os.Getenv("PROXY_ENDPOINT"),
 		HMACAccess:    os.Getenv("GCS_HMAC_ACCESS"),
 		HMACSecret:    os.Getenv("GCS_HMAC_SECRET"),
-		TestBucket:    os.Getenv("TEST_BUCKET"),
+		TestBucket:    e2eTestBucket,
 		TestPrefix:    os.Getenv("TEST_PREFIX"),
 	}
 
@@ -46,9 +52,6 @@ func LoadEnv() (*Env, error) {
 	}
 	if e.HMACSecret == "" {
 		missing = append(missing, "GCS_HMAC_SECRET")
-	}
-	if e.TestBucket == "" {
-		missing = append(missing, "TEST_BUCKET")
 	}
 
 	if len(missing) > 0 {

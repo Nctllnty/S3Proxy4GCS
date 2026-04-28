@@ -105,11 +105,19 @@ func TestRestoreObjectWithAWSSDK(t *testing.T) {
 	})
 
 	t.Run("RejectsNonPOST_WithNotImplemented", func(t *testing.T) {
-		// Send GET /<bucket>/<key>?restore — anonymous request is fine here
-		// because the proxy refuses non-POST ?restore before any signing
-		// verification would happen.
+		// Send GET /<bucket>/<key>?restore with a valid SigV4 signature so
+		// that the request reaches the restore handler (instead of being
+		// short-circuited by the HMAC credential gate). The handler should
+		// then reject the non-POST verb with 501 NotImplemented.
 		req, _ := http.NewRequest(http.MethodGet,
 			"http://storage.googleapis.com/"+getTestBucket()+"/someKey?restore", nil)
+		signer := v4.NewSigner()
+		emptyPayloadHash := fmt.Sprintf("%x", sha256.Sum256(nil))
+		if err := signer.SignHTTP(context.TODO(),
+			aws.Credentials{AccessKeyID: getAWSAccessKey(), SecretAccessKey: getAWSSecretKey()},
+			req, emptyPayloadHash, "s3", "us-east-1", time.Now()); err != nil {
+			t.Fatalf("failed to sign request: %v", err)
+		}
 		resp, err := (&http.Client{Transport: transport}).Do(req)
 		if err != nil {
 			t.Fatalf("request failed: %v", err)

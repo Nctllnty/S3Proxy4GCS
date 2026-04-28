@@ -33,7 +33,8 @@ name: multi-sdk-dns-cutting-tests
 #                                 dns.changes.create, dns.resourceRecordSets.{list,create,delete},
 #                                 dns.changes.get)
 #                               - roles/artifactregistry.writer (push pressure image)
-#   GCS_HMAC_ACCESS / GCS_HMAC_SECRET / TEST_BUCKET   (existing secrets)
+#   GCS_HMAC_ACCESS / GCS_HMAC_SECRET   (existing secrets; TEST_BUCKET is no
+#   longer needed — pressure job hard-codes `s3proxy-benchmark`)
 
 on:
   workflow_dispatch:

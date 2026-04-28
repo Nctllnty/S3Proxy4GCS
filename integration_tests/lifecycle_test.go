@@ -117,7 +117,7 @@ func TestPutLifecycleWithAWSSDK(t *testing.T) {
 
 	// Construct request
 	input := &s3.PutBucketLifecycleConfigurationInput{
-		Bucket: aws.String("test-bucket"),
+		Bucket: aws.String(getTestBucket()),
 		LifecycleConfiguration: &types.BucketLifecycleConfiguration{
 			Rules: []types.LifecycleRule{
 				{
@@ -181,7 +181,7 @@ func TestPutLifecycleMultipleTransitionsAWSSDK(t *testing.T) {
 
 	// Construct request with multiple transitions (Full Function)
 	input := &s3.PutBucketLifecycleConfigurationInput{
-		Bucket: aws.String("test-bucket"),
+		Bucket: aws.String(getTestBucket()),
 		LifecycleConfiguration: &types.BucketLifecycleConfiguration{
 			Rules: []types.LifecycleRule{
 				{

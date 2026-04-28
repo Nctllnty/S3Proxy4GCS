@@ -12,6 +12,11 @@ import boto3
 import pytest
 from botocore.config import Config
 
+# SDK_TEST_BUCKET is the real GCS bucket dedicated to Python SDK compatibility
+# tests. Provisioned once in project `cbs-poctest` (US-EAST1) and hard-coded
+# here — no TEST_BUCKET env indirection so each SDK owns an isolated bucket.
+SDK_TEST_BUCKET = "s3proxy-sdk-python"
+
 
 def _require_env(name: str) -> str:
     val = os.environ.get(name, "")
@@ -27,7 +32,7 @@ def env():
         "proxy_endpoint": _require_env("PROXY_ENDPOINT"),
         "hmac_access": _require_env("GCS_HMAC_ACCESS"),
         "hmac_secret": _require_env("GCS_HMAC_SECRET"),
-        "test_bucket": _require_env("TEST_BUCKET"),
+        "test_bucket": SDK_TEST_BUCKET,
         "test_prefix": os.environ.get("TEST_PREFIX", ""),
     }
 

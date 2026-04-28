@@ -26,6 +26,11 @@ type Env struct {
 	TestPrefix    string
 }
 
+// sdkTestBucket is the real GCS bucket dedicated to Go V2 SDK compatibility tests.
+// Provisioned once in project `cbs-poctest` (US-EAST1) and hard-coded here — no
+// TEST_BUCKET env indirection so each SDK owns an isolated bucket.
+const sdkTestBucket = "s3proxy-sdk-go-v2"
+
 var testEnv *Env
 
 func TestMain(m *testing.M) {
@@ -65,7 +70,7 @@ func LoadEnv() (*Env, error) {
 		ProxyEndpoint: os.Getenv("PROXY_ENDPOINT"),
 		HMACAccess:    os.Getenv("GCS_HMAC_ACCESS"),
 		HMACSecret:    os.Getenv("GCS_HMAC_SECRET"),
-		TestBucket:    os.Getenv("TEST_BUCKET"),
+		TestBucket:    sdkTestBucket,
 		TestPrefix:    os.Getenv("TEST_PREFIX"),
 	}
 	var missing []string
@@ -77,9 +82,6 @@ func LoadEnv() (*Env, error) {
 	}
 	if e.HMACSecret == "" {
 		missing = append(missing, "GCS_HMAC_SECRET")
-	}
-	if e.TestBucket == "" {
-		missing = append(missing, "TEST_BUCKET")
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))

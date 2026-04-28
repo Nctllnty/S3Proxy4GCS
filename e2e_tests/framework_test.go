@@ -24,11 +24,8 @@ func TestMain(m *testing.M) {
 				ProxyEndpoint: "https://storage.googleapis.com",
 				HMACAccess:    os.Getenv("GCS_HMAC_ACCESS"),
 				HMACSecret:    os.Getenv("GCS_HMAC_SECRET"),
-				TestBucket:    os.Getenv("TEST_BUCKET"),
+				TestBucket:    e2eTestBucket,
 				TestPrefix:    os.Getenv("TEST_PREFIX"),
-			}
-			if env.TestBucket == "" {
-				log.Fatalf("Direct mode requires TEST_BUCKET")
 			}
 			if env.HMACAccess == "" || env.HMACSecret == "" {
 				log.Fatalf("Direct mode requires GCS_HMAC_ACCESS and GCS_HMAC_SECRET for SDK parity")

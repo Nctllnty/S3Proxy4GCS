@@ -66,6 +66,11 @@ std::string MakeTestKey(const std::string& prefix, const std::string& suffix) {
     return prefix + "cpp-" + suffix + "-" + std::to_string(ns);
 }
 
+// kSdkTestBucket is the real GCS bucket dedicated to C++ SDK compatibility
+// tests. Provisioned once in project `cbs-poctest` (US-EAST1) and hard-coded
+// here — no TEST_BUCKET env indirection so each SDK owns an isolated bucket.
+static const char* kSdkTestBucket = "s3proxy-sdk-cpp";
+
 class S3ProxyTest : public ::testing::Test {
 protected:
     static std::shared_ptr<Aws::S3::S3Client> s3;
@@ -79,7 +84,7 @@ protected:
         std::string endpoint = GetEnvOrFail("PROXY_ENDPOINT");
         std::string access = GetEnvOrFail("GCS_HMAC_ACCESS");
         std::string secret = GetEnvOrFail("GCS_HMAC_SECRET");
-        bucket = GetEnvOrFail("TEST_BUCKET");
+        bucket = kSdkTestBucket;
         prefix = GetEnvOrDefault("TEST_PREFIX");
 
         Aws::Client::ClientConfiguration config;

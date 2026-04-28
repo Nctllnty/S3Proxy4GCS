@@ -68,7 +68,7 @@ func TestPutCorsWithAWSSDK(t *testing.T) {
 	})
 
 	input := &s3.PutBucketCorsInput{
-		Bucket: aws.String("test-cors-bucket"),
+		Bucket: aws.String(getTestBucket()),
 		CORSConfiguration: &types.CORSConfiguration{
 			CORSRules: []types.CORSRule{
 				{
@@ -90,7 +90,7 @@ func TestPutCorsWithAWSSDK(t *testing.T) {
 
 	t.Log("Sending GetBucketCors via standard AWS S3 SDK Go...")
 	getOut, err := client.GetBucketCors(context.TODO(), &s3.GetBucketCorsInput{
-		Bucket: aws.String("test-cors-bucket"),
+		Bucket: aws.String(getTestBucket()),
 	})
 	if err != nil {
 		t.Fatalf("Failed to execute GetBucketCors: %v", err)
@@ -102,7 +102,7 @@ func TestPutCorsWithAWSSDK(t *testing.T) {
 
 	t.Log("Sending DeleteBucketCors via standard AWS S3 SDK Go...")
 	_, err = client.DeleteBucketCors(context.TODO(), &s3.DeleteBucketCorsInput{
-		Bucket: aws.String("test-cors-bucket"),
+		Bucket: aws.String(getTestBucket()),
 	})
 	if err != nil {
 		t.Fatalf("Failed to execute DeleteBucketCors: %v", err)

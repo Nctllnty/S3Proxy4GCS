@@ -23,6 +23,11 @@ import static org.junit.jupiter.api.Assertions.*;
 public class S3ProxyV2Test {
 
     private static S3Client s3;
+    // SDK_TEST_BUCKET is the real GCS bucket dedicated to Java V2 SDK
+    // compatibility tests. Provisioned once in project `cbs-poctest`
+    // (US-EAST1) and hard-coded here — no TEST_BUCKET env indirection
+    // so each SDK owns an isolated bucket.
+    private static final String SDK_TEST_BUCKET = "s3proxy-sdk-java-v2";
     private static String bucket;
     private static String prefix;
 
@@ -31,7 +36,7 @@ public class S3ProxyV2Test {
         String endpoint = System.getenv("PROXY_ENDPOINT");
         String access = System.getenv("GCS_HMAC_ACCESS");
         String secret = System.getenv("GCS_HMAC_SECRET");
-        bucket = System.getenv("TEST_BUCKET");
+        bucket = SDK_TEST_BUCKET;
         prefix = System.getenv("TEST_PREFIX") != null ? System.getenv("TEST_PREFIX") : "";
 
         assertNotNull(endpoint, "PROXY_ENDPOINT required");

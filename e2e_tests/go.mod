@@ -3,7 +3,8 @@ module s3proxy4gcs/e2e
 go 1.25.0
 
 // Isolated module for E2E acceptance tests against a live proxy endpoint.
-// Requires environment variables: PROXY_ENDPOINT, GCS_HMAC_ACCESS, GCS_HMAC_SECRET, TEST_BUCKET
+// Requires environment variables: PROXY_ENDPOINT, GCS_HMAC_ACCESS, GCS_HMAC_SECRET
+// (test bucket is hard-coded to `s3proxy-e2e-test` in framework.go).
 // Run: go test -v -count=1 ./...
 
 require (

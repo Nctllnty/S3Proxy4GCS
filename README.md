@@ -18,7 +18,7 @@ cp .env.example .env
 Available Configuration Options:
 -   `PORT` (Default: `8080`): The port the proxy listens on.
 -   `GCP_PROJECT_ID`: The target Google Cloud Project ID.
--   `TARGET_BUCKET`: The target GCS bucket name.
+-   `TARGET_BUCKET` (Optional): When **empty** (recommended for production), the proxy runs in **multi-tenant mode** — every control-plane request parses the bucket from the URL path. The startup warmup probe and `/readyz` active bucket check are both skipped (`/readyz` degrades to `client_only`). When set to a specific bucket name, the value is used **only** as a warmup/`/readyz` probe hint; it does not restrict which buckets clients may target.
 -   `STORAGE_BASE_URL` (Default: `https://storage.googleapis.com`): The GCS endpoint URL.
 -   `GCS_PREFIX`: Subfolder prefix for testing or namespacing.
 -   `DRY_RUN` (Default: `true`): Disables real GCS API hits (safe for laptop testing). Set to `false` for live integration.
@@ -190,9 +190,13 @@ The proxy intercepts `PUT /?lifecycle` and maps it directly to Google Cloud Stor
 
 ---
 
-## 🔬 Integration Tests (Local, Isolated Module)
+## 🔬 Integration Tests (Local Sub-Module, Real GCS)
 
-To run automated integration tests using the **AWS S3 Go SDK** without polluting the main project module, we use an isolated sub-module:
+The `integration_tests/` module provides local integration tests that spawn the proxy as a subprocess and drive it with the real AWS SDK Go V2 against a real GCS bucket.
+
+- **Bucket**: hard-coded to `s3proxy-integration` in [`integration_tests/test_utils.go`](integration_tests/test_utils.go); logging target bucket is `s3proxy-integration-log-target`. Both are pre-provisioned in project `cbs-poctest` (US-EAST1) — no `TEST_BUCKET` env wiring.
+- **Credentials**: reuses `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from `../.env`.
+- **Run**:
 
 ```bash
 cd integration_tests
@@ -200,7 +204,7 @@ go mod tidy
 go test -v ./...
 ```
 
-The test will automatically spawn the local proxy in DryRun mode, run tests using the real AWS SDK client, and report results.
+The test harness spawns a local proxy process on port 8081 (pointed at real GCS), runs CRUD/control-plane cases via the AWS SDK, and reports results. Use `DRY_RUN=true` only for offline XML-translation sanity checks; production validation runs against the real bucket.
 
 ---
 
@@ -222,7 +226,6 @@ The `e2e_tests/` module provides a full acceptance test suite designed to run ag
 | `PROXY_ENDPOINT` | Yes | Proxy URL, e.g. `http://s3proxy.lb.local` or `http://s3proxy.default.svc:8080` |
 | `GCS_HMAC_ACCESS` | Yes | GCS HMAC Access Key ID |
 | `GCS_HMAC_SECRET` | Yes | GCS HMAC Secret Access Key |
-| `TEST_BUCKET` | Yes | Target GCS bucket name |
 | `TEST_PREFIX` | No | Object key prefix for test isolation (default: none) |
 | `STABILITY_ROUNDS` | No | Number of iterations for stability tests (default: `100`) |
 | `CONCURRENCY` | No | Number of parallel goroutines for concurrency tests (default: `10`) |
@@ -236,7 +239,7 @@ go mod tidy
 export PROXY_ENDPOINT=http://<your-proxy-endpoint>:8080
 export GCS_HMAC_ACCESS=<your-access-key>
 export GCS_HMAC_SECRET=<your-secret-key>
-export TEST_BUCKET=<your-bucket>
+# Bucket is hard-coded to `s3proxy-e2e-test` in e2e_tests/framework.go.
 export TEST_PREFIX="e2e-$(date +%s)/"
 
 # Run all tests
@@ -274,7 +277,29 @@ The workflow at `.github/workflows/e2e-tests.yml` supports **manual trigger** (`
 2. **Stability Tests** — runs long-running and concurrency tests (depends on functional)
 3. **Performance Benchmarks** — runs latency benchmarks and uploads `benchmark_report.json` as artifact
 
-Required GitHub Secrets: `GCS_HMAC_ACCESS`, `GCS_HMAC_SECRET`, `TEST_BUCKET`.
+Required GitHub Secrets: `GCS_HMAC_ACCESS`, `GCS_HMAC_SECRET`. (Bucket names are hard-coded per suite — see [Testing Bucket Inventory](#testing-bucket-inventory) below.)
+
+---
+
+## Testing Bucket Inventory
+
+All test suites now hard-code their bucket name (no `TEST_BUCKET` env). Each bucket is pre-provisioned in project `cbs-poctest`, single region `US-EAST1`. Per-suite isolation eliminates cross-language interference and lets each SDK own its fixture lifecycle.
+
+| Suite | Bucket | Purpose |
+|---|---|---|
+| `e2e_tests/` | `s3proxy-e2e-test` | Live-proxy acceptance (functional / stability / benchmark) |
+| `e2e_tests/` (direct mode) | `s3proxy-e2e-test` | `BENCH_MODE=direct` native-GCS-SDK control baseline |
+| `integration_tests/` | `s3proxy-integration` | Local-spawn proxy CRUD + control-plane CRUD |
+| `integration_tests/` logging target | `s3proxy-integration-log-target` | `PutBucketLogging` destination (separate per GCS contract) |
+| `sdk_tests/go-v2/` | `s3proxy-sdk-go-v2` | AWS SDK Go v2 compatibility |
+| `sdk_tests/go-v1/` | `s3proxy-sdk-go-v1` | AWS SDK Go v1 compatibility |
+| `sdk_tests/python/` | `s3proxy-sdk-python` | boto3 compatibility |
+| `sdk_tests/java-v1/` | `s3proxy-sdk-java-v1` | Java SDK v1 compatibility |
+| `sdk_tests/java-v2/` | `s3proxy-sdk-java-v2` | Java SDK v2 compatibility |
+| `sdk_tests/cpp/` | `s3proxy-sdk-cpp` | AWS SDK C++ compatibility |
+| `k8s/pressure-gov2-job.yaml` | `s3proxy-benchmark` | DNS-cutting pressure benchmark (go-v2) |
+
+To retarget a suite to a different bucket, edit the single constant in that suite's framework file (e.g. `e2eTestBucket` in [`e2e_tests/framework.go`](e2e_tests/framework.go)) — no workflow / Secret changes needed.
 
 ---
 

@@ -61,7 +61,9 @@ spec:
             - "-concurrency=__CONCURRENCY__"
             - "-payload-bytes=__PAYLOAD_BYTES__"
             - "-endpoint=http://s3proxy.lb.local"
-            - "-bucket=$(TEST_BUCKET)"
+            # Pressure tests run against the dedicated benchmark bucket.
+            # Hard-coded (no TEST_BUCKET env) per one-bucket-per-suite policy.
+            - "-bucket=s3proxy-benchmark"
             - "-prefix=__TEST_PREFIX__"
             - "-sdk=go-v2"
             - "-output=/tmp/pressure_report.json"
@@ -76,11 +78,6 @@ spec:
                 secretKeyRef:
                   name: s3proxy-credentials
                   key: PROXY_AWS_SECRET_ACCESS_KEY
-            - name: TEST_BUCKET
-              valueFrom:
-                secretKeyRef:
-                  name: s3proxy-config
-                  key: TARGET_BUCKET
           resources:
             requests:
               cpu: "500m"

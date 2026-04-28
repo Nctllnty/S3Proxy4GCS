@@ -57,11 +57,9 @@ spec:
               value: "8080"
             - name: GCP_PROJECT_ID
               value: "cbs-poctest"
-            - name: TARGET_BUCKET
-              valueFrom:
-                secretKeyRef:
-                  name: s3proxy-config
-                  key: TARGET_BUCKET
+            # TARGET_BUCKET is intentionally NOT set: in multi-tenant mode the
+            # proxy parses the bucket from each request's URL. Leaving this
+            # unset disables the warmup probe and /readyz active bucket check.
             - name: GCS_PREFIX
               value: "s3proxy-test/"
             - name: DRY_RUN

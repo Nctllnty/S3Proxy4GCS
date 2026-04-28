@@ -77,9 +77,9 @@ jobs:
           kubectl create secret generic s3proxy-hmac-credentials \
             --from-literal=credentials.json="${CREDENTIALS_JSON}" \
             -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create secret generic s3proxy-config \
-            --from-literal=TARGET_BUCKET=${{ secrets.TEST_BUCKET }} \
-            -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          # s3proxy-config Secret no longer carries TARGET_BUCKET: the proxy
+          # runs in multi-tenant mode (bucket parsed per-request from URL) and
+          # each SDK test suite hard-codes its own dedicated bucket.
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/hpa.yaml 2>/dev/null || true
@@ -152,7 +152,7 @@ jobs:
           PROXY_ENDPOINT: http://s3proxy.lb.local:8080
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
-          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+
           TEST_PREFIX: "sdk-gov2-${{ github.run_id }}/"
         run: set -o pipefail && go test -v -count=1 -timeout 5m ./... 2>&1 | tee test-output.txt
 
@@ -210,7 +210,7 @@ jobs:
           PROXY_ENDPOINT: http://s3proxy.lb.local:8080
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
-          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+
           TEST_PREFIX: "sdk-gov1-${{ github.run_id }}/"
         run: set -o pipefail && go test -v -count=1 -timeout 5m ./... 2>&1 | tee test-output.txt
 
@@ -269,7 +269,7 @@ jobs:
           PROXY_ENDPOINT: http://s3proxy.lb.local:8080
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
-          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+
           TEST_PREFIX: "sdk-py-${{ github.run_id }}/"
         run: |
           set -o pipefail
@@ -333,7 +333,7 @@ jobs:
           PROXY_ENDPOINT: http://s3proxy.lb.local:8080
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
-          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+
           TEST_PREFIX: "sdk-javav1-${{ github.run_id }}/"
         run: set -o pipefail && mvn test -B 2>&1 | tee test-output.txt
 
@@ -394,7 +394,7 @@ jobs:
           PROXY_ENDPOINT: http://s3proxy.lb.local:8080
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
-          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+
           TEST_PREFIX: "sdk-javav2-${{ github.run_id }}/"
           AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
           AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
@@ -456,7 +456,7 @@ jobs:
           PROXY_ENDPOINT: http://s3proxy.lb.local:8080
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
-          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+
           TEST_PREFIX: "sdk-cpp-${{ github.run_id }}/"
           AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
         run: |
@@ -528,7 +528,7 @@ jobs:
           PROXY_ENDPOINT: http://s3proxy.lb.local:8080
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
-          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+
           TEST_PREFIX: "e2e-stability-${{ github.run_id }}/"
           STABILITY_ROUNDS: ${{ inputs.stability_rounds }}
           CONCURRENCY: ${{ inputs.concurrency }}
@@ -543,7 +543,7 @@ jobs:
           PROXY_ENDPOINT: http://s3proxy.lb.local:8080
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
-          TEST_BUCKET: ${{ secrets.TEST_BUCKET }}
+
           TEST_PREFIX: "e2e-ops-${{ github.run_id }}/"
         run: |
           go test -v -count=1 -timeout 5m \

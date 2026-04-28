@@ -51,11 +51,8 @@ spec:
                 secretKeyRef:
                   name: s3proxy-credentials
                   key: PROXY_AWS_SECRET_ACCESS_KEY
-            - name: TEST_BUCKET
-              valueFrom:
-                secretKeyRef:
-                  name: s3proxy-config
-                  key: TARGET_BUCKET
+            # TEST_BUCKET is no longer passed in: e2e_tests/framework.go hard-codes
+            # `s3proxy-e2e-test` (see AGENTS.md). Each test suite owns its bucket.
             - name: TEST_PREFIX
               value: "bench-incluster/"
             - name: BENCH_CONCURRENCY

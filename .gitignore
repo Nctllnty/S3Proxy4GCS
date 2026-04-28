@@ -7,6 +7,8 @@ integration_tests/s3proxy4gcs_test_bin
 # Configuration
 .env
 *-key.json
+# Local HMAC credential map (copied from K8s secret for local integration tests)
+s3proxy-hmac-credentials.json
 
 # Go workspace
 /vendor/

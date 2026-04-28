@@ -32,11 +32,8 @@ spec:
             # BENCH_MODE=direct: skip proxy health check, use native GCS SDK
             - name: BENCH_MODE
               value: "direct"
-            - name: TEST_BUCKET
-              valueFrom:
-                secretKeyRef:
-                  name: s3proxy-config
-                  key: TARGET_BUCKET
+            # TEST_BUCKET is no longer passed in: e2e_tests/framework.go hard-codes
+            # `s3proxy-e2e-test` (see AGENTS.md).
             - name: TEST_PREFIX
               value: "direct-bench/"
             - name: BENCH_CONCURRENCY
