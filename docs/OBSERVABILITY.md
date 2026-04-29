@@ -5,8 +5,9 @@ exposes and explains how to combine them when debugging incidents.
 
 ## 1. Logs
 
-The proxy maintains **two independent logging systems** with different
-purposes and output sinks.
+The proxy maintains **three independent logging systems** with different
+purposes and output sinks: a real-time JSON stream on stderr, a CSV access
+log per request, and an error-only logfmt file for at-a-glance triage.
 
 ### 1.1 slog JSON log (stdout) — real-time diagnostics
 
@@ -96,7 +97,35 @@ volume, sized for a single-shard Cloud Logging sink.
 - Compliance audit log retention (configurable `REQUEST_LOG_KEEP_DAYS`).
 - Cross-reference with GCS-side logs via `GUploaderUploadID`.
 
-### 1.3 Comparison
+### 1.3 errlog file (`error_YYYYMMDD.log`) — error-only triage stream
+
+**Source**: `pkg/errlog/errlog.go`, wired in `main.go` as a `slog.Handler`
+that wraps the JSON stderr handler.\
+**Output**: local file `/var/log/s3proxy/error_YYYYMMDD.log` (configurable
+via `ERROR_LOG_PATH`). Falls back to stderr-only when
+`ERROR_LOG_ENABLED=false`.\
+**Format**: logfmt-style line per record, e.g.
+
+```
+time="2026-04-29T02:51:01Z" level=error msg="GCS API call failed" error="404 NotFound" status="404" request_id="abc"
+```
+
+**Trigger**: any `slog.Error` (or higher) call across the codebase is
+mirrored. Info/Warn/Debug records continue to flow to the stderr JSON
+stream only — the file stays small and grep-friendly.\
+**Write mode**: asynchronous channel buffer (`ERROR_LOG_CHAN_BUF`,
+default 4096), non-blocking.\
+**Rotation**: daily by default, plus size-based rotation
+(`ERROR_LOG_MAX_SIZE_MB`) and automatic cleanup of files older than
+`ERROR_LOG_KEEP_DAYS` days (default 14).
+
+**Typical use cases**:
+- Quick incident triage: `tail -F /var/log/s3proxy/error_$(date +%Y%m%d).log`.
+- Error-rate spot checks without hitting Cloud Logging quota.
+- Correlate with stderr JSON via the `request_id` attribute (always carried
+  through by the wrapping handler).
+
+### 1.4 Comparison
 
 | | slog JSON (stdout) | reqlog CSV (file) |
 |---|---|---|

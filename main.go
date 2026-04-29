@@ -39,6 +39,7 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 
+	"s3proxy4gcs/pkg/errlog"
 	"s3proxy4gcs/pkg/reqlog"
 )
 
@@ -93,12 +94,30 @@ func main() {
 		reqlog.StartCleanup(logDir, config.Config.ReqLogKeepDays)
 	}
 
-	// Initialize Structured JSON Logger (slog)
+	// Initialize error-only file sink (logfmt via ymlog) BEFORE slog wiring
+	// so the very first slog.Error during startup is captured. Falls back
+	// to stderr-only when disabled.
+	if config.Config.ErrLogEnabled {
+		errlog.Init(
+			config.Config.ErrLogPath,
+			config.Config.ErrLogMaxSizeMB,
+			config.Config.ErrLogMaxBackup,
+			config.Config.ErrLogChanBuf,
+		)
+		errLogDir := filepath.Dir(strings.ReplaceAll(config.Config.ErrLogPath, "%Y%M%D", "placeholder"))
+		errlog.StartCleanup(errLogDir, config.Config.ErrLogKeepDays)
+	}
+
+	// Initialize Structured JSON Logger (slog). The errlog handler wraps
+	// the JSON stderr handler: every record still flows to stderr, and
+	// records at LevelError or higher are mirrored to the local error
+	// log file when ERROR_LOG_ENABLED=true.
 	var level slog.Level = slog.LevelInfo
 	if config.Config.DebugLogging {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	jsonHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	logger := slog.New(errlog.NewHandler(jsonHandler))
 	slog.SetDefault(logger)
 
 	gcsCtx = context.Background()

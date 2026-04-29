@@ -124,6 +124,18 @@ type Settings struct {
 	ReqLogChanBuf   int    // REQUEST_LOG_CHAN_BUF,       default 10240
 	ReqLogKeepDays  int    // REQUEST_LOG_KEEP_DAYS,     default 7
 
+	// Error-only structured log file (logfmt via ymlog). Mirrors every
+	// slog.Error/Critical record to a daily-rotated local file independent
+	// of the stderr JSON stream so operators can grep `level=error` without
+	// scraping container logs. Uses the same async / rotation contract as
+	// the request log above.
+	ErrLogEnabled   bool   // ERROR_LOG_ENABLED,        default true
+	ErrLogPath      string // ERROR_LOG_PATH,            default "./logs/error_%Y%M%D.log"
+	ErrLogMaxSizeMB int    // ERROR_LOG_MAX_SIZE_MB,     default 256
+	ErrLogMaxBackup int    // ERROR_LOG_MAX_BACKUP,      default 5
+	ErrLogChanBuf   int    // ERROR_LOG_CHAN_BUF,        default 4096
+	ErrLogKeepDays  int    // ERROR_LOG_KEEP_DAYS,       default 14
+
 	// Features toggles every plane's operations on/off. See FeatureFlags doc.
 	Features FeatureFlags
 }
@@ -261,6 +273,32 @@ func LoadConfig() {
 		}
 	}
 
+	errLogEnabled := getEnv("ERROR_LOG_ENABLED", "true") == "true"
+	errLogMaxSizeMB := 256
+	if v := getEnv("ERROR_LOG_MAX_SIZE_MB", "256"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			errLogMaxSizeMB = n
+		}
+	}
+	errLogMaxBackup := 5
+	if v := getEnv("ERROR_LOG_MAX_BACKUP", "5"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			errLogMaxBackup = n
+		}
+	}
+	errLogChanBuf := 4096
+	if v := getEnv("ERROR_LOG_CHAN_BUF", "4096"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			errLogChanBuf = n
+		}
+	}
+	errLogKeepDays := 14
+	if v := getEnv("ERROR_LOG_KEEP_DAYS", "14"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			errLogKeepDays = n
+		}
+	}
+
 	features := FeatureFlags{
 		Lifecycle:       getEnvBool("ENABLE_LIFECYCLE", true),
 		CORS:            getEnvBool("ENABLE_CORS", true),
@@ -315,6 +353,12 @@ func LoadConfig() {
 		ReqLogMaxBackup:           reqLogMaxBackup,
 		ReqLogChanBuf:             reqLogChanBuf,
 		ReqLogKeepDays:            reqLogKeepDays,
+		ErrLogEnabled:             errLogEnabled,
+		ErrLogPath:                getEnv("ERROR_LOG_PATH", "./logs/error_%Y%M%D.log"),
+		ErrLogMaxSizeMB:           errLogMaxSizeMB,
+		ErrLogMaxBackup:           errLogMaxBackup,
+		ErrLogChanBuf:             errLogChanBuf,
+		ErrLogKeepDays:            errLogKeepDays,
 		Features:                  features,
 	}
 
