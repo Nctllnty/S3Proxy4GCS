@@ -1645,9 +1645,9 @@ func handlePutObjectTagging(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updateMetadata := translate.TranslateS3ToGCSTagging(s3Cfg, attrs.Metadata)
+	newContexts := translate.TranslateS3ToGCSContexts(s3Cfg, attrs.Contexts)
 	uattrs := storage.ObjectAttrsToUpdate{
-		Metadata: updateMetadata,
+		Contexts: newContexts,
 	}
 
 	err = timeGCSCall(r.Context(), "PutObjectTagging", func(ctx context.Context) error {
@@ -1695,7 +1695,7 @@ func handleGetObjectTagging(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s3Cfg := translate.TranslateGCSToS3Tagging(attrs.Metadata)
+	s3Cfg := translate.TranslateGCSContextsToS3Tagging(attrs.Contexts)
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
 	xml.NewEncoder(w).Encode(s3Cfg)
@@ -1731,15 +1731,11 @@ func handleDeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updateMetadata := make(map[string]string)
-	for k := range attrs.Metadata {
-		if strings.HasPrefix(strings.ToLower(k), strings.ToLower(translate.S3TagPrefix)) {
-			updateMetadata[k] = "" // Set to empty to delete
-		}
-	}
-
+	// Clearing all Object Contexts: pass an empty Custom map so the SDK
+	// signals "remove every context key" to GCS. A nil Custom would be a
+	// no-op per SDK semantics.
 	uattrs := storage.ObjectAttrsToUpdate{
-		Metadata: updateMetadata,
+		Contexts: &storage.ObjectContexts{Custom: map[string]storage.ObjectCustomContextPayload{}},
 	}
 
 	err = timeGCSCall(r.Context(), "DeleteObjectTagging", func(ctx context.Context) error {

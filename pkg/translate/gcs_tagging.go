@@ -2,50 +2,54 @@ package translate
 
 import (
 	"log/slog"
-	"strings"
+
+	"cloud.google.com/go/storage"
 )
 
-const S3TagPrefix = "s3tag-"
+// TranslateS3ToGCSContexts computes the GCS Object Contexts patch that
+// mirrors the supplied S3 Tagging XML document.
+//
+// Semantics:
+//   - Every key in `existing.Custom` that is NOT present in the new TagSet
+//     is marked with Delete=true so GCS removes it.
+//   - Every tag in the new TagSet is written as an upsert
+//     (Value populated, Delete=false). If the same key existed before,
+//     the upsert supersedes the delete marker.
+//
+// The returned *ObjectContexts is safe to assign directly to
+// ObjectAttrsToUpdate.Contexts.
+func TranslateS3ToGCSContexts(s3Cfg Tagging, existing *storage.ObjectContexts) *storage.ObjectContexts {
+	custom := make(map[string]storage.ObjectCustomContextPayload)
 
-// TranslateS3ToGCSTagging computes the metadata update map for GCS.
-// It clears existing s3tag- keys by setting them to "" and sets new ones.
-func TranslateS3ToGCSTagging(s3Cfg Tagging, existingMetadata map[string]string) map[string]string {
-	slog.Info("Translating S3 Object Tagging to GCS Metadata")
-
-	updateMap := make(map[string]string)
-
-	// 1. Mark all existing s3tag- keys for deletion (set to "")
-	for k := range existingMetadata {
-		if strings.HasPrefix(k, S3TagPrefix) {
-			updateMap[k] = ""
+	// 1. Mark every existing context key for deletion first.
+	if existing != nil {
+		for k := range existing.Custom {
+			custom[k] = storage.ObjectCustomContextPayload{Delete: true}
 		}
 	}
 
-	// 2. Set new tags
+	// 2. Upsert new tags; this overrides any delete marker for the same key.
 	for _, tag := range s3Cfg.TagSet {
-		// Replace characters if necessary, but assume standard keys for now.
-		// AWS allows alphanumeric, spaces, and + - = . _ : /
-		// GCS allows standard HTTP header characters.
-		k := S3TagPrefix + tag.Key
-		updateMap[k] = tag.Value
-		slog.Debug("Tag translated", "key", k, "value", tag.Value)
+		custom[tag.Key] = storage.ObjectCustomContextPayload{Value: tag.Value}
+		slog.Debug("Tag translated to GCS Object Context", "key", tag.Key, "value", tag.Value)
 	}
 
-	return updateMap
+	return &storage.ObjectContexts{Custom: custom}
 }
 
-// TranslateGCSToS3Tagging converts GCS object metadata back to S3 Tagging XML
-func TranslateGCSToS3Tagging(metadata map[string]string) *Tagging {
+// TranslateGCSContextsToS3Tagging converts GCS Object Contexts back to an
+// S3 Tagging XML document. A nil or empty Contexts yields an empty TagSet.
+func TranslateGCSContextsToS3Tagging(ctx *storage.ObjectContexts) *Tagging {
 	t := &Tagging{}
-	for k, v := range metadata {
-		if strings.HasPrefix(strings.ToLower(k), strings.ToLower(S3TagPrefix)) {
-			key := k[len(S3TagPrefix):]
-			if key == "" {
-				slog.Warn("Skipping GCS metadata entry with empty tag key after prefix", "raw_key", k)
-				continue
-			}
-			t.TagSet = append(t.TagSet, Tag{Key: key, Value: v})
+	if ctx == nil {
+		return t
+	}
+	for k, v := range ctx.Custom {
+		if k == "" {
+			slog.Warn("Skipping GCS Object Context entry with empty key")
+			continue
 		}
+		t.TagSet = append(t.TagSet, Tag{Key: k, Value: v.Value})
 	}
 	return t
 }

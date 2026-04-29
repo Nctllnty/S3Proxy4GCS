@@ -4,6 +4,31 @@ All notable changes to the s3proxy4gcs project are documented in this file.
 Dates are in ISO-8601. Versions follow semver; log/metric label changes are
 listed under "Breaking (observability)" so downstream dashboards can adapt.
 
+## Unreleased — Tagging backend switched to GCS Object Contexts
+
+### Changed
+- **`?tagging` (Put/Get/Delete Object Tagging) now stores tags in GCS
+  native Object Contexts** instead of custom metadata. All three handlers
+  in [main.go](main.go) read from `ObjectAttrs.Contexts` and write through
+  `ObjectAttrsToUpdate.Contexts`. OCC via `IfMetagenerationMatch` is
+  preserved. The translate layer
+  ([pkg/translate/gcs_tagging.go](pkg/translate/gcs_tagging.go)) exposes
+  `TranslateS3ToGCSContexts` and `TranslateGCSContextsToS3Tagging` in place
+  of the previous metadata-map helpers.
+- DeleteObjectTagging now clears every Object Context by sending an empty
+  `Custom` map, rather than zeroing out `s3tag-*` metadata keys.
+
+### Breaking
+- **Legacy `s3tag-*` custom-metadata values are no longer read or written**
+  by the Tagging API. Tags authored before this change remain as-is on
+  objects but are invisible to `GetObjectTagging`; run an offline migration
+  (e.g. `gcloud storage objects update --update-custom-contexts=...`) if
+  you need to port them over.
+- Deployment IAM must grant
+  `storage.objects.createContext`, `storage.objects.updateContext`, and
+  `storage.objects.deleteContext` (covered by
+  `roles/storage.objectUser`).
+
 ## v2.0.1 — Multi-SDK re-sign fix: unconditional header strip (2026-04-18)
 
 ### Fixed

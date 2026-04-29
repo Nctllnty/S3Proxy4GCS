@@ -534,4 +534,4 @@ Handles bi-directional translation between AWS S3 XML schemas and Google Cloud S
 - **[cors](pkg/translate/gcs_cors.go)**: Maps S3 XML CORS permissions to GCS Go SDK types.
 - **[logging](pkg/translate/gcs_logging.go)**: Parses and holds bucket logging specifications.
 - **[website](pkg/translate/gcs_website.go)**: Maps main page suffixes and 404 error documents.
-- **[tagging](pkg/translate/gcs_tagging.go)**: Translates tags into GCS custom metadata using Optimistic Concurrency Control (OCC) to prevent overwrite losses.
+- **[tagging](pkg/translate/gcs_tagging.go)**: Translates S3 object tags into GCS native **Object Contexts** (`ObjectAttrsToUpdate.Contexts`) using Optimistic Concurrency Control (OCC, `IfMetagenerationMatch`) to prevent overwrite losses. Legacy `s3tag-*` custom metadata is no longer read or written.

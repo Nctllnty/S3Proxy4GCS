@@ -31,7 +31,7 @@ Choosing between a GLB Extension and a Cloud Run proxy depends on whether the fe
 - **Versioning Interop**: Injecting the `x-amz-interop-list-objects-format: enabled` header upon request and mapping `x-goog-generation` to `x-amz-version-id` on the response.
 - **RestoreObject (Synthetic Responses)**: Immediately returning `200 OK` without hitting GCS, since objects are "live". _Implemented in the Cloud Run proxy as of v1.5 with an optional HEAD existence probe so missing keys still return `404 NoSuchKey`._
 - **Proxy Protection (ABAC)**: Inspecting the URL to proactively reject unsupported requests like `PUT ?policy` with `501 Not Implemented`.
-- **Transparent Tag Translation**: Rewriting standard S3 `x-amz-tagging` upload headers into GCS custom metadata `x-goog-meta-s3tag-` instantly.
+- **Transparent Tag Translation**: (Legacy approach — superseded.) Rewriting `x-amz-tagging` upload headers into `x-goog-meta-s3tag-` was the original plan; the proxy now stores object tags in GCS native **Object Contexts** instead of custom metadata, so this header-rewrite shortcut is no longer applicable.
 
 **🟡 Difficult for GLB Extensions (Requires Body Translation & Re-signing)**
 - **DeleteObjects (Multi-Object Delete)**: Fully supported by passing the HMAC v4 re-signed payload directly to GCS's native XML API, requiring no heavy custom fan-out translation in the proxy.
@@ -63,8 +63,8 @@ These features are infrequent bucket management API calls. The proxy only needs 
 These features intercept high-frequency data path operations or require heavy background processing. They introduce significant latency, require high proxy resources (memory/connections), or involve complex race conditions.
 
 #### 1. Tagging (Object Tagging) — **[Implemented ✅]**
-**Issue**: GCS lacks an exact `?tagging` equivalent and relies on object metadata. 
-**Implementation**: The Proxy transparently translates `PUT ?tagging` requests directly into GCS Object Custom Metadata (`x-goog-meta-s3tag-`). It uses a read-modify-write cycle with **Optimistic Concurrency Control (IfMetagenerationMatch)** to prevent lost updates safely without heavy locking.
+**Issue**: S3 `?tagging` needs a first-class key-value store attached to each object.
+**Implementation**: The Proxy translates `PUT/GET/DELETE ?tagging` requests directly into GCS native **Object Contexts** (`ObjectAttrsToUpdate.Contexts` via the Go SDK). PUT performs a read-modify-write cycle with **Optimistic Concurrency Control (`IfMetagenerationMatch`)**: keys not present in the incoming TagSet are marked `Delete=true` and incoming tags are upserted. DELETE clears every context key by sending an empty `Custom` map. The legacy `s3tag-*` custom-metadata backend has been retired; historical `s3tag-*` values on existing objects are ignored by the Tagging API.
 
 #### 2. Access Control (ACLs & Policies & Tag-Based ABAC) - **[Deferred]**
 **Issue**: S3 uses XML ACLs, JSON Bucket Policies. GCS uses IAM.
