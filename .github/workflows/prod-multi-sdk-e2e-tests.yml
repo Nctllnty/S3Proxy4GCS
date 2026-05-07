@@ -460,6 +460,8 @@ jobs:
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET_PROD }}
           TEST_BUCKET: s3proxy-sdk-cpp-g4
           TEST_PREFIX: "sdk-cpp-${{ github.run_id }}/"
+          AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+          AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
         run: |
           set -o pipefail
           mkdir -p build && cd build
