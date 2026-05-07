@@ -10,6 +10,7 @@ metadata:
     networking.gke.io/load-balancer-type: "Internal"
 spec:
   type: LoadBalancer
+  trafficDistribution: PreferSameZone
   selector:
     app: s3proxy
   ports:
