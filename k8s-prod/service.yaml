@@ -7,9 +7,10 @@ metadata:
     app: s3proxy
     environment: production
   annotations:
-    networking.gke.io/load-balancer-type: "Internal"
+    cloud.google.com/l4-rbs: "enabled"
 spec:
   type: LoadBalancer
+  externalTrafficPolicy: Local
   trafficDistribution: PreferSameZone
   selector:
     app: s3proxy

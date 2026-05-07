@@ -26,6 +26,19 @@ spec:
         environment: production
     spec:
       serviceAccountName: s3proxy
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: s3proxy
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: s3proxy
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -42,10 +55,16 @@ spec:
                 labelSelector:
                   matchLabels:
                     app: s3proxy
+                topologyKey: topology.kubernetes.io/zone
+            - weight: 90
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: s3proxy
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: s3proxy
-          image: us-east1-docker.pkg.dev/robust-charge-495605-g4/s3proxy/s3proxy:initial
+          image: us-east1-docker.pkg.dev/robust-charge-495605-g4/s3proxy/s3proxy:a6cd0153efc234a76a8ef21b8c4d08d0e47f507a
           ports:
             - containerPort: 8080
               protocol: TCP
