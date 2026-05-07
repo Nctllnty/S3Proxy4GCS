@@ -444,7 +444,13 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev libaws-sdk-cpp-dev
+          sudo apt-get install -y cmake g++ ninja-build pkg-config zip unzip tar curl git libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev
+
+      - name: Install AWS SDK C++ via vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git /tmp/vcpkg
+          /tmp/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          /tmp/vcpkg/vcpkg install aws-sdk-cpp[core,s3]:x64-linux
 
       - name: Build and Run Tests
         working-directory: sdk_tests/cpp
@@ -457,8 +463,8 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/tmp/vcpkg/scripts/buildsystems/vcpkg.cmake
+          cmake --build . -j$(nproc)
           ./s3proxy_cpp_tests 2>&1 | tee ../test-output.txt
 
       - name: Upload Results
