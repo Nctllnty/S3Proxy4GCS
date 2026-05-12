@@ -6,7 +6,7 @@ on:
       proxy_endpoint:
         description: 'S3 Proxy endpoint URL'
         type: string
-        default: 'http://35.185.56.169'
+        default: 'http://34.23.246.250'
       test_bucket:
         description: 'Test bucket name'
         type: string
@@ -31,7 +31,7 @@ jobs:
       - name: Run TestListObjectVersions
         working-directory: sdk_tests/go-v2
         env:
-          PROXY_ENDPOINT: ${{ github.event.inputs.proxy_endpoint || 'http://35.185.56.169' }}
+          PROXY_ENDPOINT: ${{ github.event.inputs.proxy_endpoint || 'http://34.23.246.250' }}
           GCS_HMAC_ACCESS: ${{ secrets.GCS_HMAC_ACCESS }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
           TEST_BUCKET: ${{ github.event.inputs.test_bucket || 's3proxy-sdk-go-v2-g4' }}
