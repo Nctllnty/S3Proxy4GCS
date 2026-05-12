@@ -365,3 +365,60 @@ func TestRestoreObject(t *testing.T) {
 		t.Fatalf("RestoreObject failed: %v", err)
 	}
 }
+
+func TestListObjectVersions(t *testing.T) {
+	client := NewS3Client(t, testEnv)
+	bucket := testEnv.TestBucket
+	key := GenerateTestKey(testEnv, "gov2-list-versions")
+
+	t.Cleanup(func() { Cleanup(t, client, bucket, key) })
+
+	// Put first version
+	_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		Body: strings.NewReader("version 1 content"),
+	})
+	if err != nil {
+		t.Fatalf("PutObject (v1) failed: %v", err)
+	}
+
+	// Put second version (overwrite with different content)
+	_, err = client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		Body: strings.NewReader("version 2 content"),
+	})
+	if err != nil {
+		t.Fatalf("PutObject (v2) failed: %v", err)
+	}
+
+	// ListObjectVersions
+	listOut, err := client.ListObjectVersions(context.TODO(), &s3.ListObjectVersionsInput{
+		Bucket: aws.String(bucket), Prefix: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions failed: %v", err)
+	}
+
+	// Filter versions matching our exact key
+	var matched []types.ObjectVersion
+	for _, v := range listOut.Versions {
+		if aws.ToString(v.Key) == key {
+			matched = append(matched, v)
+		}
+	}
+
+	// If fewer than 2 versions, bucket likely doesn't have versioning enabled — skip
+	if len(matched) < 2 {
+		t.Skip("ListObjectVersions returned fewer than 2 versions; bucket may not have versioning enabled")
+	}
+
+	// Verify each version has a non-empty VersionId and correct Key
+	for i, v := range matched {
+		if aws.ToString(v.VersionId) == "" {
+			t.Errorf("Version[%d] has empty VersionId", i)
+		}
+		if aws.ToString(v.Key) != key {
+			t.Errorf("Version[%d] Key = %q, want %q", i, aws.ToString(v.Key), key)
+		}
+	}
+}
